@@ -1,0 +1,90 @@
+// CatalogDb Schema for dbdiagram.io
+// Context: Catalog (Digital Services Price List & Tariffs)
+// Engine: Microsoft SQL Server 2022 (EF Core Code First)
+
+Project CatalogDb {
+  database_type: 'MSSQL'
+  Note: 'База даних контексту прайс-листа веб-студії (Catalog Bounded Context). Орієнтована на EF Core Code First.'
+}
+
+Table Category {
+  Id bigint [pk, increment, note: 'PK категорії послуг']
+  Name nvarchar(100) [not null, unique, note: 'Назва напрямку (Веб-розробка, Дизайн, Маркетинг тощо)']
+  Description nvarchar(500)
+  CreatedAt datetime2 [not null, default: `SYSUTCDATETIME()`]
+  CreatedBy nvarchar(100) [not null, default: `'system'`]
+  UpdatedAt datetime2
+  UpdatedBy nvarchar(100)
+  IsDeleted bit [not null, default: 0]
+
+  indexes {
+    Name [name: 'UQ_Category_Name', unique]
+    IsDeleted [name: 'IX_Category_IsDeleted', note: 'Фільтрований індекс WHERE IsDeleted = 0']
+  }
+}
+
+Table Product {
+  Id bigint [pk, increment, note: 'PK позиції прайс-листа']
+  Sku nvarchar(50) [not null, unique, note: 'Унікальний артикул (напр. SRV-LAND-01)']
+  Name nvarchar(200) [not null, note: 'Назва послуги або товару']
+  ItemType nvarchar(20) [not null, default: `'Service'`, note: 'CHECK: Service, Product']
+  Price decimal(18,2) [not null, note: 'CHECK (Price > 0)']
+  IsActive bit [not null, default: 1]
+  CreatedAt datetime2 [not null, default: `SYSUTCDATETIME()`]
+  CreatedBy nvarchar(100) [not null, default: `'system'`]
+  UpdatedAt datetime2
+  UpdatedBy nvarchar(100)
+  IsDeleted bit [not null, default: 0]
+  RowVersion rowversion
+
+  indexes {
+    Sku [name: 'UQ_Product_Sku', unique]
+    Name [name: 'IX_Product_Name', note: 'Індекс під пошук за назвою']
+    Price [name: 'IX_Product_Price', note: 'Індекс під сортування за ціною']
+    ItemType [name: 'IX_Product_ItemType']
+    IsDeleted [name: 'IX_Product_IsDeleted', note: 'Фільтрований індекс WHERE IsDeleted = 0']
+  }
+}
+
+Table ProductDetail {
+  ProductId bigint [pk, note: 'PK і одночасно FK до Product(Id) (1:1), ON DELETE CASCADE']
+  Description nvarchar(max) [not null, note: 'Детальний опис скоупу робіт']
+  Unit nvarchar(50) [not null, default: `'послуга'`, note: 'Одиниця виміру (проєкт, місяць, година, ліцензія)']
+  DurationMinutes int [note: 'Орієнтовна тривалість виконання у хвилинах (NULL для товарів)']
+  TaxRate decimal(5,2) [not null, default: 20.00, note: 'Ставка ПДВ у відсотках']
+  CreatedAt datetime2 [not null, default: `SYSUTCDATETIME()`]
+  CreatedBy nvarchar(100) [not null, default: `'system'`]
+  UpdatedAt datetime2
+  UpdatedBy nvarchar(100)
+}
+
+Table PriceHistory {
+  Id bigint [pk, increment, note: 'PK запису історії ціни']
+  ProductId bigint [not null, note: 'FK до Product(Id), ON DELETE CASCADE']
+  Price decimal(18,2) [not null, note: 'CHECK (Price > 0)']
+  ValidFrom datetime2 [not null, default: `SYSUTCDATETIME()`]
+  ValidTo datetime2 [note: 'CHECK (ValidTo IS NULL OR ValidTo > ValidFrom)']
+  ChangedBy nvarchar(100) [not null, default: `'system'`]
+  Reason nvarchar(250)
+
+  indexes {
+    (ProductId, ValidFrom) [name: 'IX_PriceHistory_ProductId_ValidFrom']
+  }
+}
+
+Table ProductCategory {
+  ProductId bigint [not null, note: 'FK до Product(Id), ON DELETE CASCADE']
+  CategoryId bigint [not null, note: 'FK до Category(Id), ON DELETE CASCADE']
+  AddedAt datetime2 [not null, default: `SYSUTCDATETIME()`, note: 'Дата прив\'язки послуги до категорії']
+
+  indexes {
+    (ProductId, CategoryId) [pk]
+    CategoryId [name: 'IX_ProductCategory_CategoryId']
+  }
+}
+
+// Relationships
+Ref: ProductDetail.ProductId - Product.Id [delete: cascade]
+Ref: PriceHistory.ProductId > Product.Id [delete: cascade]
+Ref: ProductCategory.ProductId > Product.Id [delete: cascade]
+Ref: ProductCategory.CategoryId > Category.Id [delete: cascade]

@@ -1,0 +1,134 @@
+// SalesDb Schema for dbdiagram.io
+// Context: Sales (CRM Deals, Clients & Pipeline)
+// Engine: Microsoft SQL Server 2022 (ADO.NET + Dapper)
+
+Project SalesDb {
+  database_type: 'MSSQL'
+  Note: 'База даних контексту продажів (Sales Bounded Context). Орієнтована на ADO.NET та Dapper.'
+}
+
+Table TeamMembers {
+  Id bigint [pk, increment, note: 'PK співробітника студії']
+  FullName nvarchar(150) [not null]
+  Email nvarchar(255) [not null, unique, note: 'Корпоративний email']
+  Role nvarchar(50) [not null, note: 'CHECK: Owner, SalesManager, AccountManager']
+  IsActive bit [not null, default: 1]
+  CreatedAt datetime2 [not null, default: `SYSUTCDATETIME()`]
+  CreatedBy nvarchar(100) [not null, default: `'system'`]
+  UpdatedAt datetime2
+  UpdatedBy nvarchar(100)
+  IsDeleted bit [not null, default: 0]
+
+  indexes {
+    Email [name: 'UQ_TeamMembers_Email', unique]
+    IsDeleted [name: 'IX_TeamMembers_IsDeleted', note: 'Фільтрований індекс WHERE IsDeleted = 0']
+  }
+}
+
+Table Clients {
+  Id bigint [pk, increment, note: 'PK контрагента / клієнта']
+  CompanyName nvarchar(200) [not null, note: 'Назва компанії клієнта']
+  ContactPerson nvarchar(150) [not null, note: 'Контактна особа']
+  Email nvarchar(255) [not null, unique, note: 'Унікальний email клієнта']
+  Phone nvarchar(50)
+  Industry nvarchar(100)
+  CreatedAt datetime2 [not null, default: `SYSUTCDATETIME()`]
+  CreatedBy nvarchar(100) [not null, default: `'system'`]
+  UpdatedAt datetime2
+  UpdatedBy nvarchar(100)
+  IsDeleted bit [not null, default: 0]
+  RowVersion rowversion
+
+  indexes {
+    Email [name: 'UQ_Clients_Email', unique]
+    IsDeleted [name: 'IX_Clients_IsDeleted', note: 'Фільтрований індекс WHERE IsDeleted = 0']
+  }
+}
+
+Table Products {
+  Id bigint [pk, note: 'Синхронізований Id з CatalogDb (без IDENTITY, без міжсерверного FK)']
+  Name nvarchar(200) [not null]
+  Price decimal(18,2) [not null, note: 'CHECK (Price > 0)']
+  IsActive bit [not null, default: 1]
+  CreatedAt datetime2 [not null, default: `SYSUTCDATETIME()`]
+  CreatedBy nvarchar(100) [not null, default: `'system'`]
+  UpdatedAt datetime2
+  UpdatedBy nvarchar(100)
+
+  indexes {
+    IsActive [name: 'IX_Products_IsActive']
+  }
+}
+
+Table Deals {
+  Id bigint [pk, increment, note: 'PK угоди']
+  DealNumber nvarchar(50) [not null, unique, note: 'Унікальний номер угоди (DL-YYYYMMDD-XXXX)']
+  Title nvarchar(250) [not null, note: 'Назва угоди (напр. Створення лендінгу для ТОВ Агро)']
+  ClientId bigint [not null, note: 'FK до Clients, ON DELETE NO ACTION']
+  OwnerId bigint [not null, note: 'FK до TeamMembers (відповідальний менеджер), ON DELETE NO ACTION']
+  Stage nvarchar(50) [not null, default: `'Lead'`, note: 'CHECK: Lead, Qualified, ProposalSent, Negotiation, Won, Lost']
+  TotalAmount decimal(18,2) [not null, default: 0.00, note: 'CHECK (TotalAmount >= 0)']
+  CreatedAt datetime2 [not null, default: `SYSUTCDATETIME()`]
+  CreatedBy nvarchar(100) [not null, default: `'system'`]
+  UpdatedAt datetime2
+  UpdatedBy nvarchar(100)
+  IsDeleted bit [not null, default: 0]
+  RowVersion rowversion
+
+  indexes {
+    ClientId [name: 'IX_Deals_ClientId']
+    OwnerId [name: 'IX_Deals_OwnerId']
+    Stage [name: 'IX_Deals_Stage', note: 'Індекс під вибірку активних угод воронки за етапами']
+    IsDeleted [name: 'IX_Deals_IsDeleted', note: 'Фільтрований індекс WHERE IsDeleted = 0']
+  }
+}
+
+Table DealDetails {
+  DealId bigint [pk, note: 'PK і одночасно FK до Deals(Id) (1:1), ON DELETE CASCADE']
+  Source nvarchar(100) [not null, default: `'Inbound'`, note: 'Джерело ліда (Inbound, Referral, Website тощо)']
+  Description nvarchar(max)
+  LostReason nvarchar(500) [note: 'Причина програшу (обов\'язкова при переході в Lost)']
+  ExpectedCloseDate datetime2
+  CreatedAt datetime2 [not null, default: `SYSUTCDATETIME()`]
+  CreatedBy nvarchar(100) [not null, default: `'system'`]
+  UpdatedAt datetime2
+  UpdatedBy nvarchar(100)
+}
+
+Table DealItems {
+  DealId bigint [not null, note: 'FK до Deals(Id), ON DELETE CASCADE']
+  ProductId bigint [not null, note: 'Локальний FK до Products(Id), ON DELETE NO ACTION']
+  ProductName nvarchar(200) [not null, note: 'Знімок назви послуги на момент додавання']
+  UnitPrice decimal(18,2) [not null, note: 'Знімок ціни на момент додавання (CHECK > 0)']
+  Discount decimal(18,2) [not null, default: 0.00, note: 'Знижка (CHECK: 0 <= Discount <= Quantity*UnitPrice)']
+  Quantity int [not null, default: 1, note: 'CHECK (Quantity > 0)']
+  TotalPrice decimal(18,2) [note: 'Обчислюваний стовпець: Quantity * UnitPrice - Discount']
+  CreatedAt datetime2 [not null, default: `SYSUTCDATETIME()`]
+  CreatedBy nvarchar(100) [not null, default: `'system'`]
+
+  indexes {
+    (DealId, ProductId) [pk]
+  }
+}
+
+Table DealStatusHistory {
+  Id bigint [pk, increment]
+  DealId bigint [not null, note: 'FK до Deals(Id), ON DELETE CASCADE']
+  OldStatus nvarchar(50)
+  NewStatus nvarchar(50) [not null]
+  ChangedAt datetime2 [not null, default: `SYSUTCDATETIME()`]
+  ChangedBy nvarchar(100) [not null, default: `'system'`]
+  Reason nvarchar(500)
+
+  indexes {
+    (DealId, ChangedAt) [name: 'IX_DealStatusHistory_DealId_ChangedAt']
+  }
+}
+
+// Relationships
+Ref: Deals.ClientId > Clients.Id [delete: no action]
+Ref: Deals.OwnerId > TeamMembers.Id [delete: no action]
+Ref: DealDetails.DealId - Deals.Id [delete: cascade]
+Ref: DealItems.DealId > Deals.Id [delete: cascade]
+Ref: DealItems.ProductId > Products.Id [delete: no action]
+Ref: DealStatusHistory.DealId > Deals.Id [delete: cascade]
