@@ -6,4 +6,7 @@
     <Project Path="Services/Sales/Sales.Dal/Sales.Dal.csproj" />
     <Project Path="Services/Sales/Sales.Domain/Sales.Domain.csproj" />
   </Folder>
+  <Folder Name="/tests/">
+    <Project Path="Services/Sales/Sales.Tests/Sales.Tests.csproj" />
+  </Folder>
 </Solution>

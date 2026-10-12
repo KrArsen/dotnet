@@ -10,7 +10,8 @@ public static class ServiceCollectionExtensions
 {
     public static IServiceCollection AddSalesBll(this IServiceCollection services)
     {
-        // Пам'ять та кешування ідемпотентності
+        // Пам'ять, логування та кешування ідемпотентності
+        services.AddLogging();
         services.AddMemoryCache();
         services.AddSingleton<IIdempotencyStore, MemoryIdempotencyStore>();
 
