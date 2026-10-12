@@ -395,3 +395,320 @@ db.activities.insertOne({
 | 6 | **Тестування воронки у tests.sql** | **Виконано** | Повний позитивний цикл `Lead` → `Won` та всі негативні сценарії (перескок у Won, без позицій, без причини). Очищення даних наприкінці. |
 | 7 | **Поліморфізм та валідація ActivitiesDb** | **Виконано** | Документи різних типів підтверджено валідним JSON. Валідатор `$jsonSchema` відхиляє тип `fax`. |
 | 8 | **Таблиця політики дублювання** | **Виконано** | Повністю збігається в `README.md` та `docs/duplication-policy.md`. |
+
+---
+
+# Практична робота №02: Тришарова архітектура на базі ADO.NET та Dapper
+
+## 1. Загальний огляд мікросервісу Sales
+
+У межах практичної роботи №02 реалізовано мікросервіс **Sales** («Продажі») предметної області **CRM для малого бізнесу** як повноцінну вертикаль:
+$$\text{DAL} \longrightarrow \text{BLL} \longrightarrow \text{Web/API}$$
+
+Мікросервіс працює з базою даних `SalesDb` (Microsoft SQL Server 2022), створеною у Лабораторній роботі №01. Система оркеструється за допомогою **.NET Aspire**, підтримує наскрізне трасування (`X-Correlation-Id`), централізовану обробку помилок у форматі **RFC 7807/9457 ProblemDetails** (коди 400, 404, 409, 500) та інтерактивну документацію Swagger на `/swagger`.
+
+Детальний архітектурний опис наведено в [docs/lab02-architecture.md](docs/lab02-architecture.md).
+
+---
+
+## 2. Структура рішень та проєктів
+
+```
+Platform.slnx
+├── Platform.AppHost/                        # .NET Aspire AppHost (оркестрація контейнера SQL Server + API + скрипти)
+│   ├── AppHost.cs
+│   └── Platform.AppHost.csproj
+├── Services/Sales/
+│   ├── Sales.Domain/                        # Доменні моделі, константи статусів, винятки (0 залежностей)
+│   ├── Sales.Dal/                           # Рівень доступу до даних (чистий ADO.NET + Dapper + Unit of Work)
+│   ├── Sales.Bll/                           # Бізнес-логіка (DTO, AutoMapper, валідатори, ідемпотентність)
+│   ├── Sales.Api/                           # ASP.NET Core Web API (контролери, middleware, Swagger)
+│   └── Sales.Tests/                         # Юніт- та інтеграційні тести (xUnit, NSubstitute, WebApplicationFactory)
+├── db/                                      # Бази даних Лабораторної №01 (SalesDb, CatalogDb, ActivitiesDb)
+│   ├── p1/                                  # SalesDb: schema.sql, procedures.sql, seed.sql
+│   ├── p2/                                  # CatalogDb: schema.sql, seed.sql
+│   └── p3/                                  # ActivitiesDb: collections.js, seed.js
+└── docs/
+    ├── context-description.md
+    ├── duplication-policy.md
+    └── lab02-architecture.md                # Архітектурна документація Лабораторної №02
+```
+
+---
+
+## 3. Особливості реалізації архітектурних шарів
+
+### 3.1. Рівень даних (Sales.Dal)
+- **Інтерфейс Generic Repository:** `IGenericRepository<T>` визначає базові операції CRUD (`GetByIdAsync`, `GetAllAsync`, `AddAsync`, `UpdateAsync`, `DeleteAsync`).
+- **Чистий ADO.NET (`ClientRepository`):**
+  - **Свідомо НЕ успадковує `IGenericRepository<T>`**.
+  - Пряме керування `SqlCommand`, `SqlDataReader` та типізованими параметрами (`SqlDbType.NVarChar`, `SqlDbType.BigInt`, `SqlDbType.Timestamp`).
+  - Оптимістичне блокування (Optimistic Concurrency) через системний стовпець `RowVersion ROWVERSION NOT NULL` — перевірка версії при модифікації; при розбіжності кидається `BusinessConflictException` (HTTP 409).
+  - Спеціалізований метод `RegisterWonDealAsync` для атомарної фіксації успішної угоди.
+- **Dapper (`DealRepository`, `ProductRepository`, `TeamMemberRepository`):**
+  - Успадковують базовий клас `BaseDapperRepository<T>`.
+  - Усі запити використовують `CommandDefinition` з передачею транзакції, таймауту та `CancellationToken`.
+  - `DealRepository` викликає збережені процедури (`usp_CreateDeal`, `usp_AddDealItem`, `usp_AdvanceDealStage`, `usp_WinDeal`, `usp_LoseDeal`), читає множинні результати через `QueryMultipleAsync` (`usp_GetDealById`) та виконує пагіноване читання через представлення `vw_DealSummary`.
+- **Unit of Work (`UnitOfWork`):**
+  - Гарантує роботу всіх репозиторіїв на **єдиному фізичному з'єднанні `SqlConnection`** у межах життєвого циклу HTTP-запиту (`Scoped`).
+  - Управління транзакціями: `BeginTransactionAsync`, `CommitAsync`, `RollbackAsync`.
+  - Захист від пастки `XACT_ABORT ON` у SQL Server: перевірка `if (_transaction.Connection != null)` перед відкатом транзакції.
+  - Реалізує `IAsyncDisposable`.
+- **Трансляція винятків (`SqlExceptionTranslator`):**
+  - Код 50001 $\rightarrow$ `NotFoundException` (404)
+  - Коди 50002, 50003, 50004, 2601, 2627, 547, 1205 $\rightarrow$ `BusinessConflictException` (409)
+  - Код 50005 $\rightarrow$ `ValidationException` (400)
+
+### 3.2. Рівень бізнес-логіки (Sales.Bll)
+- **DTO та AutoMapper:** Повна ізоляція внутрішніх сутностей від зовнішнього API (`ClientDto`, `DealDto`, `DealDetailsDto`, `DealItemDto`, `DealSummaryDto`, `DealStatsDto`, `ProductDto`, `TeamMemberDto`). Валідовано викликом `AssertConfigurationIsValid()`.
+- **Валідація бізнес-правил (Рівень 2):** `ClientValidator` та `DealValidator` перевіряють стан агрегатів (активність клієнта/менеджера, непорожність позицій, відсутність дублювання ProductId у межах угоди, заборону модифікації закритих угод).
+- **Ідемпотентність:** `IIdempotencyStore` на базі `IMemoryCache` кешує відповіді за заголовком `Idempotency-Key` (TTL 24 години). Повторний запит із тим самим ключем повертає кешовану відповідь із заголовком `X-Cache-Lookup: HIT`.
+- **Атомарна бізнес-операція `WinDealAsync`:**
+  - Об'єднує два репозиторії у спільній транзакції: Dapper Stored Procedure `usp_WinDeal` + чистий ADO.NET `Clients.RegisterWonDealAsync`.
+  - Якщо клієнт видалений або виникає конфлікт версій, обидві операції відкочуються через `uow.RollbackAsync()`, і стадія угоди повертається до початкової.
+
+### 3.3. Рівень представлення (Sales.Api)
+- **Архітектурна ізоляція:** Контролери та Middleware **НЕ мають посилань `using Sales.Dal`**. Доступ до даних відбувається виключно через BLL-сервіси.
+- **Маршрутизація:** Атрибутна маршрутизація (`[ApiController]`, `[Route("api/[controller]")]`).
+- **Асинхронність:** Усі екшени контролерів є асинхронними (`async/await`) та підтримують `CancellationToken`.
+- **Correlation ID Middleware:** Зчитує або генерує `X-Correlation-Id`, додає його у відповідь та пушить у Serilog `LogContext`.
+- **Централізований Exception Handler:** `DomainExceptionHandler` транслює винятки у формат `application/problem+json` з `traceId` та `correlationId`.
+- **Swagger / OpenAPI:** Документація на `/swagger`, кореневий запит `/` автоматично перенаправляє на Swagger UI.
+
+---
+
+## 4. Запуск проєкту
+
+### 4.1. Запуск однією командою через .NET Aspire
+Оркестратор автоматично підніме SQL Server 2022 у контейнері, застосує SQL-скрипти з `db/p1/` та запустить Web API:
+
+```bash
+dotnet run --project Platform.AppHost
+```
+Після старту в консолі відобразиться посилання на Aspire Dashboard (наприклад, `http://localhost:15000`), де доступні метрики, логи та посилання на сервіс `sales-api`.
+
+### 4.2. Автономний запуск (Standalone)
+За наявності локально запущеного SQL Server (наприклад, із портом 1433 за замовчуванням):
+
+```bash
+# 1. Застосувати скрипти Лаб 01 до бази SalesDb (якщо ще не застосовані)
+# 2. Запустити Sales.Api
+dotnet run --project Services/Sales/Sales.Api
+```
+API буде доступний за адресою:
+- Swagger UI: `http://localhost:5000/swagger`
+- HTTP: `http://localhost:5000`
+- HTTPS: `https://localhost:5001`
+
+---
+
+## 5. Приклади HTTP-запитів (cURL)
+
+### 5.1. Управління клієнтами (Clients API - чистий ADO.NET)
+
+**Створити клієнта (201 Created):**
+```bash
+curl -X POST http://localhost:5000/api/clients \
+  -H "Content-Type: application/json" \
+  -H "X-User: owner@studio.ua" \
+  -d '{
+    "companyName": "TechStart LLC",
+    "contactPerson": "Олексій Петренко",
+    "email": "alex@techstart.ua",
+    "phone": "+380501112233",
+    "industry": "IT"
+  }'
+```
+
+**Отримати клієнта за ID (200 OK):**
+```bash
+curl -X GET http://localhost:5000/api/clients/1
+```
+
+**Оновити клієнта з перевіркою версії RowVersion (200 OK):**
+```bash
+curl -X PUT http://localhost:5000/api/clients/1 \
+  -H "Content-Type: application/json" \
+  -H "X-User: manager@studio.ua" \
+  -d '{
+    "companyName": "TechStart Innovations",
+    "contactPerson": "Олексій Петренко",
+    "email": "alex@techstart.ua",
+    "phone": "+380501112233",
+    "industry": "FinTech",
+    "rowVersion": "AAAAAAAAB9Q="
+  }'
+```
+
+**М'яке видалення клієнта (204 No Content):**
+```bash
+curl -X DELETE http://localhost:5000/api/clients/1 \
+  -H "X-User: owner@studio.ua"
+```
+
+---
+
+### 5.2. Управління угодами (Deals API - Dapper + Stored Procedures)
+
+**Створити нову угоду з ідемпотентністю (201 Created):**
+```bash
+curl -X POST http://localhost:5000/api/deals \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: deal-create-req-001" \
+  -H "X-User: manager@studio.ua" \
+  -d '{
+    "clientId": 1,
+    "ownerId": 2,
+    "title": "Розробка корпоративного порталу",
+    "source": "Website",
+    "description": "Створення MVP для нового клієнта",
+    "expectedCloseDate": "2026-12-01T00:00:00Z",
+    "items": [
+      {
+        "productId": 1,
+        "quantity": 1,
+        "discount": 5000.00
+      }
+    ]
+  }'
+```
+
+**Додати товарну позицію до угоди (200 OK):**
+```bash
+curl -X POST http://localhost:5000/api/deals/1/items \
+  -H "Content-Type: application/json" \
+  -H "X-User: manager@studio.ua" \
+  -d '{
+    "productId": 4,
+    "quantity": 2,
+    "discount": 0.00
+  }'
+```
+
+**Перевести угоду на наступну стадію воронки (Prospect $\rightarrow$ Negotiation) (204 No Content):**
+```bash
+curl -X POST http://localhost:5000/api/deals/1/advance \
+  -H "Content-Type: application/json" \
+  -H "X-User: manager@studio.ua" \
+  -d '{
+    "reason": "Комерційну пропозицію погоджено, переходимо до переговорів"
+  }'
+```
+
+**Успішно закрити угоду (Won) — транзакція через 2 репозиторії (204 No Content):**
+```bash
+curl -X POST http://localhost:5000/api/deals/1/win \
+  -H "Idempotency-Key: deal-win-req-001" \
+  -H "X-User: manager@studio.ua"
+```
+
+**Закрити угоду як програну (Lost) (204 No Content):**
+```bash
+curl -X POST http://localhost:5000/api/deals/2/lose \
+  -H "Content-Type: application/json" \
+  -H "X-User: manager@studio.ua" \
+  -d '{
+    "reason": "Клієнт призупинив проєкт через скорочення річного бюджету"
+  }'
+```
+
+**Отримати агреговану статистику воронки (200 OK):**
+```bash
+curl -X GET http://localhost:5000/api/deals/stats
+```
+
+---
+
+### 5.3. Перегляд реплік каталогу та команди (Read-Only)
+
+**Перелік товарів/послуг:**
+```bash
+curl -X GET http://localhost:5000/api/products
+```
+
+**Перелік співробітників:**
+```bash
+curl -X GET http://localhost:5000/api/team-members
+```
+
+---
+
+## 6. Демонстрація відповідей у форматі ProblemDetails (RFC 7807)
+
+### 6.1. Помилка валідації (HTTP 400 Bad Request)
+**Запит:** `POST /api/clients` із порожньою назвою та невалідним email.
+**Відповідь:**
+```json
+{
+  "type": "https://tools.ietf.org/html/rfc9110#section-15.5.1",
+  "title": "Помилка валідації запиту",
+  "status": 400,
+  "detail": "Помилка валідації вхідних даних клієнта.",
+  "instance": "/api/clients",
+  "errors": {
+    "CompanyName": [
+      "Назва компанії є обов'язковою."
+    ],
+    "Email": [
+      "Некоректний формат електронної пошти."
+    ]
+  },
+  "traceId": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+  "correlationId": "d3b07384-d113-4638-b7d6-3e4293f92e9a"
+}
+```
+
+### 6.2. Ресурс не знайдено (HTTP 404 Not Found)
+**Запит:** `GET /api/clients/999999`
+**Відповідь:**
+```json
+{
+  "type": "https://tools.ietf.org/html/rfc9110#section-15.5.5",
+  "title": "Ресурс не знайдено",
+  "status": 404,
+  "detail": "Клієнта з ID 999999 не знайдено.",
+  "instance": "/api/clients/999999",
+  "traceId": "00-6a7f8e9a0b1c2d3e4f5a6b7c8d9e0f1a-1122334455667788-01",
+  "correlationId": "8f3e2b1a-9c4d-4e5f-a6b7-c8d9e0f1a2b3"
+}
+```
+
+### 6.3. Конфлікт бізнес-правил (HTTP 409 Conflict)
+**Запит:** `POST /api/deals/15/win` для угоди без доданих товарних позицій або за наявності м'яко видаленого клієнта:
+**Відповідь:**
+```json
+{
+  "type": "https://tools.ietf.org/html/rfc9110#section-15.5.10",
+  "title": "Конфлікт бізнес-правил",
+  "status": 409,
+  "detail": "Неможливо виграти угоду без доданих товарів/послуг або якщо сума дорівнює нулю.",
+  "instance": "/api/deals/15/win",
+  "traceId": "00-9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d-9988776655443322-01",
+  "correlationId": "e1f2a3b4-c5d6-4e7f-8a9b-0c1d2e3f4a5b"
+}
+```
+
+---
+
+## 7. Результати модульного та інтеграційного тестування
+
+Тестовий набір у `Services/Sales/Sales.Tests` покриває всі ключові сценарії та запускається командою:
+
+```bash
+dotnet test
+```
+
+### Фактичний звіт тестування:
+- **Загальна кількість тестів:** 19
+- **Пройдено успішно:** 19
+- **Провалено:** 0
+- **Пропущено:** 0
+
+| Група тестів | Кількість | Перевірений функціонал |
+| :--- | :---: | :--- |
+| **`DealServiceTests`** | 4 | Успішна фіксація транзакції `WinDealAsync`; відкат транзакції при падінні другого репозиторію (`Clients`); валідація відсутності позицій; відкат при відсутності угоди. |
+| **`AutoMapperTests`** | 1 | Повна валідація профілів AutoMapper 16 (`AssertConfigurationIsValid`) для всіх сутностей та DTO. |
+| **`SqlExceptionTranslatorTests`** | 5 | Трансляція кодів 50001 (404), 50002 (409), 50005 (400), унікальних ключів 2601/2627 (409) та дедлоку 1205 (409). |
+| **`UnitOfWorkTests`** | 3 | Безпека подвійного `DisposeAsync`, безпека виклику `RollbackAsync` без транзакції, валідація порожнього рядка підключення. |
+| **`ApiIntegrationTests`** | 6 | Генерація та збереження `X-Correlation-Id`, повернення 400 ProblemDetails при помилках валідації, 404 ProblemDetails для відсутнього ресурсу, 409 ProblemDetails при конфлікті, доступність Swagger JSON. |
+
