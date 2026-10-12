@@ -1,0 +1,20 @@
+## .NET Core / C# gitignore
+bin/
+obj/
+[Bb]in/
+[Oo]bj/
+.vs/
+*.user
+*.userosscache
+*.suo
+*.userprefs
+*.pidb
+*.booproj
+*.svclog
+*.visualstudio/
+
+# Aspire & Rider / IDEs
+.idea/
+*.DotSettings.user
+_ReSharper*/
+apphost.run.json
