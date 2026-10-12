@@ -44,4 +44,15 @@ public class ProductsController : ControllerBase
 
         return Ok(product);
     }
+
+    /// <summary>
+    /// Пошук активних товарів або послуг за назвою
+    /// </summary>
+    [HttpGet("search")]
+    [ProducesResponseType(typeof(IReadOnlyList<ProductDto>), StatusCodes.Status200OK)]
+    public async Task<ActionResult<IReadOnlyList<ProductDto>>> Search([FromQuery] string name, CancellationToken ct)
+    {
+        var products = await _productService.GetActiveByNameAsync(name ?? string.Empty, ct);
+        return Ok(products);
+    }
 }

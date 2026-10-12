@@ -84,6 +84,10 @@ graph TD
    - Метод `DealRepository.GetWithDetailsAsync` викликає процедуру `usp_GetDealById`, яка за один мережевий круг (roundtrip) повертає 4 набори результатів: заголовок угоди, деталі (`DealDetails`), позиції (`DealItems`) та історію переходів стадій (`DealStatusHistory`). Dapper зчитує їх через `QueryMultipleAsync` з мінімальним latency.
    - Метод `DealRepository.CreateAsync` передає позиції угоди у вигляді JSON через параметр `@ItemsJson NVARCHAR(MAX)` у процедуру `usp_CreateDeal`, яка парсить їх за допомогою `OPENJSON`.
 3. **Обов'язкове використання `CommandDefinition`:** Усі запити до Dapper передаються через `CommandDefinition` із зазначенням активної транзакції, таймауту та токена скасування `CancellationToken`.
+4. **Спеціалізовані методи пошуку та захист репліки каталогу:**
+   - `ProductRepository.GetActiveByNameAsync(name)`: безпечний пошук активних послуг/товарів із екрануванням спеціальних символів SQL LIKE (`[`, `%`, `_`) через `EscapeLikePattern`.
+   - `ProductRepository.AddAsync`, `UpdateAsync`, `DeleteAsync`: кидають `NotSupportedException` із чітким повідомленням, оскільки `Products` у `SalesDb` є локальною реплікою каталогу `CatalogDb` (політика дублювання Лаб. 01); модифікації дозволені лише в первинному контексті Catalog.
+   - `TeamMemberRepository.GetByEmailAsync(email)`: швидкий пошук співробітника студії за електронною поштою через типізований параметр Dapper.
 
 ---
 
@@ -95,6 +99,7 @@ graph TD
 public class UnitOfWork : IUnitOfWork
 {
     private readonly SqlConnection _connection;
+    private readonly ILogger<UnitOfWork>? _logger;
     private SqlTransaction? _transaction;
 
     public IClientRepository Clients => _clients ??= new ClientRepository(_connection, () => _transaction, _options);
@@ -105,6 +110,8 @@ public class UnitOfWork : IUnitOfWork
 }
 ```
 
+Усі переходи життєвого циклу транзакції (`BeginTransactionAsync`, `CommitAsync`, `RollbackAsync`) логуються за допомогою `ILogger<UnitOfWork>`.
+
 ### Пастка `XACT_ABORT ON` у SQL Server
 Якщо збережена процедура кидає помилку з увімкненим `SET XACT_ABORT ON`, SQL Server автоматично завершує серверний стан транзакції. У клієнтському драйвері `Microsoft.Data.SqlClient` властивість `_transaction.Connection` стає `null`. Виклик методу `_transaction.RollbackAsync()` у такому разі призведе до `InvalidOperationException: This SqlTransaction has completed; it is no longer usable`.
 `UnitOfWork` враховує цю пастку та безпечно перевіряє `if (_transaction.Connection != null)` перед відкатом:
@@ -114,6 +121,28 @@ if (_transaction.Connection != null)
     await _transaction.RollbackAsync(ct);
 }
 ```
+
+---
+
+## 4.1. Знімок цін та назв у BLL (Snapshot Pattern)
+
+Згідно з політикою дублювання Лаб. 01, ціна та назва товару/послуги на момент включення в комерційну пропозицію мають залишатися незмінними навіть при подальшій зміні тарифів у каталозі `CatalogDb`.
+У `DealService.CreateAsync` та `DealService.AddItemAsync`:
+1. BLL вичитує актуальну інформацію про товар через `_uow.Products.GetByIdAsync(item.ProductId)`.
+2. Явно копіює `product.Name` у `ProductName` та `product.Price` у `UnitPrice`:
+   ```csharp
+   // знімок на момент додавання, політика дублювання Лаб. 01, не оновлюється
+   var dealItem = new DealItem
+   {
+       DealId = dealId,
+       ProductId = product.Id,
+       ProductName = product.Name,
+       UnitPrice = product.Price,
+       Quantity = item.Quantity,
+       Discount = item.Discount
+   };
+   ```
+3. Створення угоди з позиціями `DealService.CreateAsync` виконується всередині транзакції `UnitOfWork` (`BeginTransactionAsync` $\to$ `usp_CreateDeal` $\to$ запис історії статусу $\to$ `CommitAsync`), що гарантує атомарність.
 
 ---
 
@@ -190,3 +219,43 @@ sequenceDiagram
 2. Використовує динамічні порти, що запобігає конфліктам із портами локальної машини розробника.
 3. Завантажує файли `schema.sql`, `procedures.sql` та `seed.sql` із каталогу `db/p1/` та передає їх у `salesDb.WithCreationScript(...)`, гарантуючи автоматичне розгортання схеми бази даних при старті контейнера.
 4. Проєкт `sales-api` автоматично отримує рядок підключення до `SalesDb` через інжекцію залежностей `.WithReference(salesDb)` та очікує повної готовності бази даних `.WaitFor(salesDb)`.
+
+---
+
+## 8. Повний перелік кінцевих точок API (Endpoints Matrix)
+
+| Метод | Маршрут | Опис | Рівень доступу до даних |
+| :---: | :--- | :--- | :--- |
+| `GET` | `/api/clients` | Отримати список клієнтів (з пагінацією та пошуком за назвою) | Чистий ADO.NET (`ClientRepository.GetPagedAsync`) |
+| `GET` | `/api/clients/{id}` | Отримати деталі клієнта за ID | Чистий ADO.NET (`ClientRepository.GetByIdAsync`) |
+| `POST` | `/api/clients` | Створити нового клієнта | Чистий ADO.NET (`ClientRepository.AddAsync`) |
+| `PUT` | `/api/clients/{id}` | Оновити клієнта з перевіркою версії `RowVersion` | Чистий ADO.NET (`ClientRepository.UpdateAsync`) |
+| `DELETE` | `/api/clients/{id}` | М'яке видалення клієнта (`IsDeleted = 1`) | Чистий ADO.NET (`ClientRepository.DeleteAsync`) |
+| `GET` | `/api/deals` | Пагінований список угод через представлення `vw_DealSummary` | Dapper (`DealRepository.GetPagedSummariesAsync`) |
+| `GET` | `/api/deals/{id}` | Повна агрегована картка угоди з 4 наборами даних | Dapper (`DealRepository.GetWithDetailsAsync`, `usp_GetDealById`) |
+| `POST` | `/api/deals` | Створити нову угоду з позиціями (транзакція UoW) | Dapper (`DealRepository.CreateAsync`, `usp_CreateDeal`) |
+| `POST` | `/api/deals/{id}/items` | Додати позицію до угоди (знімок ціни та назви) | Dapper (`DealRepository.AddItemAsync`, `usp_AddDealItem`) |
+| `POST` | `/api/deals/{id}/advance` | Перевести угоду на наступну стадію воронки | Dapper (`DealRepository.AdvanceStageAsync`, `usp_AdvanceDealStage`) |
+| `POST` | `/api/deals/{id}/win` | Успішно закрити угоду (транзакція: Dapper SP + ADO.NET) | Dapper + ADO.NET (`usp_WinDeal` + `RegisterWonDealAsync`) |
+| `POST` | `/api/deals/{id}/lose` | Закрити угоду як програну з фіксацією причини | Dapper (`DealRepository.LoseAsync`, `usp_LoseDeal`) |
+| `GET` | `/api/deals/stats` | Агрегована статистика угод за стадіями | Dapper (`DealRepository.GetStatsAsync`) |
+| `GET` | `/api/products` | Список активних товарів та послуг каталогу | Dapper (`ProductRepository.GetActiveAsync`) |
+| `GET` | `/api/products/search` | Пошук послуг/товарів за назвою з екрануванням LIKE | Dapper (`ProductRepository.GetActiveByNameAsync`) |
+| `GET` | `/api/products/{id}` | Деталі товару/послуги за ID | Dapper (`ProductRepository.GetByIdAsync`) |
+| `GET` | `/api/team-members` | Список активних менеджерів та співробітників студії | Dapper (`TeamMemberRepository.GetActiveAsync`) |
+| `GET` | `/api/team-members/by-email` | Пошук співробітника за адресою електронної пошти | Dapper (`TeamMemberRepository.GetByEmailAsync`) |
+| `GET` | `/api/team-members/{id}` | Деталі співробітника за ID | Dapper (`TeamMemberRepository.GetByIdAsync`) |
+
+---
+
+## 9. Покриття тестами (Test Suite: 25 тестів)
+
+| Тестовий клас | Кількість | Перевірений функціонал |
+| :--- | :---: | :--- |
+| **`DealServiceTests`** | 5 | Атомарний коміт `WinDealAsync`; відкат транзакції при падінні оновлення клієнта; валідація непорожності позицій; відкат при неіснуючій угоді; збереження знімка назви та ціни товару під час створення угоди всередині транзакції UoW. |
+| **`ProductRepositoryTests`** | 3 | Перевірка захисту від модифікації локальної репліки каталогу: `AddAsync`, `UpdateAsync`, `DeleteAsync` кидають `NotSupportedException`. |
+| **`AutoMapperTests`** | 1 | Повна валідація конфігурації `AssertConfigurationIsValid` (усі DTO та сутності з урахуванням конфігурації ліцензійного ключа AutoMapper). |
+| **`SqlExceptionTranslatorTests`** | 5 | Трансляція кодів 50001 (404), 50002 (409), 50005 (400), порушення унікальності 2601/2627 (409) та взаємного блокування 1205 (409). |
+| **`UnitOfWorkTests`** | 3 | Безпека подвійного `DisposeAsync`; безпечний виклик `RollbackAsync` без активної транзакції; валідація порожнього рядка підключення. |
+| **`ApiIntegrationTests`** | 8 | Наскрізне трасування `X-Correlation-Id`; валідація Рівня 1 (DataAnnotations) повертає 400 ProblemDetails без звернення до BLL; коректна обробка апострофів у назвах компаній (O'Brien); 404 ProblemDetails; 409 ProblemDetails; безпечна обробка 500 Internal Server Error без витоку деталей SQL; доступність OpenAPI / Swagger. |
+

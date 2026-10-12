@@ -44,4 +44,21 @@ public class TeamMembersController : ControllerBase
 
         return Ok(member);
     }
+
+    /// <summary>
+    /// Отримати співробітника за електронною поштою
+    /// </summary>
+    [HttpGet("by-email")]
+    [ProducesResponseType(typeof(TeamMemberDto), StatusCodes.Status200OK)]
+    [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status404NotFound)]
+    public async Task<ActionResult<TeamMemberDto>> GetByEmail([FromQuery] string email, CancellationToken ct)
+    {
+        var member = await _teamMemberService.GetByEmailAsync(email ?? string.Empty, ct);
+        if (member == null)
+        {
+            throw new NotFoundException($"Співробітника з email '{email}' не знайдено.");
+        }
+
+        return Ok(member);
+    }
 }

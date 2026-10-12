@@ -8,6 +8,7 @@ public interface IProductService
 {
     Task<ProductDto?> GetByIdAsync(long id, CancellationToken ct = default);
     Task<IReadOnlyList<ProductDto>> GetAllAsync(CancellationToken ct = default);
+    Task<IReadOnlyList<ProductDto>> GetActiveByNameAsync(string name, CancellationToken ct = default);
 }
 
 /// <summary>
@@ -37,12 +38,19 @@ public class ProductService : IProductService
         var products = await _uow.Products.GetAllAsync(ct);
         return _mapper.Map<IReadOnlyList<ProductDto>>(products);
     }
+
+    public async Task<IReadOnlyList<ProductDto>> GetActiveByNameAsync(string name, CancellationToken ct = default)
+    {
+        var products = await _uow.Products.GetActiveByNameAsync(name, ct);
+        return _mapper.Map<IReadOnlyList<ProductDto>>(products);
+    }
 }
 
 public interface ITeamMemberService
 {
     Task<TeamMemberDto?> GetByIdAsync(long id, CancellationToken ct = default);
     Task<IReadOnlyList<TeamMemberDto>> GetAllAsync(CancellationToken ct = default);
+    Task<TeamMemberDto?> GetByEmailAsync(string email, CancellationToken ct = default);
 }
 
 public class TeamMemberService : ITeamMemberService
@@ -66,5 +74,11 @@ public class TeamMemberService : ITeamMemberService
     {
         var members = await _uow.TeamMembers.GetAllAsync(ct);
         return _mapper.Map<IReadOnlyList<TeamMemberDto>>(members);
+    }
+
+    public async Task<TeamMemberDto?> GetByEmailAsync(string email, CancellationToken ct = default)
+    {
+        var member = await _uow.TeamMembers.GetByEmailAsync(email, ct);
+        return member == null ? null : _mapper.Map<TeamMemberDto>(member);
     }
 }

@@ -35,6 +35,79 @@ public class DealServiceTests
     }
 
     [Fact]
+    public async Task CreateAsync_ExecutesWithinTransaction_AndSnapshotsProductNameAndPrice()
+    {
+        // Arrange
+        const long productId = 5;
+        var product = new Product
+        {
+            Id = productId,
+            Name = "SEO Оптимізація та аудит",
+            Price = 15000m,
+            IsActive = true
+        };
+
+        var dto = new CreateDealDto
+        {
+            ClientId = 10,
+            OwnerId = 2,
+            Title = "Проєкт просування в пошуку",
+            Source = "Website",
+            Items = new List<CreateDealItemDto>
+            {
+                new CreateDealItemDto
+                {
+                    ProductId = productId,
+                    Quantity = 2,
+                    Discount = 1000m
+                }
+            }
+        };
+
+        _uow.Products.GetByIdAsync(productId, Arg.Any<CancellationToken>()).Returns(product);
+        _uow.Deals.CreateAsync(Arg.Any<Deal>(), Arg.Any<DealDetails>(), Arg.Any<IEnumerable<DealItem>>(), Arg.Any<CancellationToken>())
+            .Returns(100L);
+
+        var createdDeal = new Deal
+        {
+            Id = 100L,
+            Title = dto.Title,
+            ClientId = dto.ClientId,
+            OwnerId = dto.OwnerId,
+            Stage = DealStatuses.Lead,
+            TotalAmount = 29000m,
+            Items = new List<DealItem>
+            {
+                new DealItem
+                {
+                    DealId = 100L,
+                    ProductId = productId,
+                    ProductName = product.Name,
+                    UnitPrice = product.Price,
+                    Quantity = 2,
+                    Discount = 1000m
+                }
+            }
+        };
+
+        _uow.Deals.GetWithDetailsAsync(100L, Arg.Any<CancellationToken>()).Returns(createdDeal);
+
+        // Act
+        var result = await _sut.CreateAsync(dto, "manager@studio.ua");
+
+        // Assert
+        result.Should().NotBeNull();
+        result.Id.Should().Be(100L);
+        result.Items.Should().HaveCount(1);
+        result.Items[0].ProductName.Should().Be("SEO Оптимізація та аудит");
+        result.Items[0].UnitPrice.Should().Be(15000m);
+
+        await _uow.Received(1).BeginTransactionAsync(IsolationLevel.ReadCommitted, Arg.Any<CancellationToken>());
+        await _uow.Received(1).CommitAsync(Arg.Any<CancellationToken>());
+        await _uow.DidNotReceive().RollbackAsync(Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
     public async Task WinDealAsync_WhenBothRepositoriesSucceed_CommitsTransaction()
     {
         // Arrange

@@ -18,3 +18,8 @@ obj/
 *.DotSettings.user
 _ReSharper*/
 apphost.run.json
+
+# Logs
+logs/
+*.log
+

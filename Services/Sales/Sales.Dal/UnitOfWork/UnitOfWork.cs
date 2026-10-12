@@ -1,5 +1,6 @@
 using System.Data;
 using Microsoft.Data.SqlClient;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Sales.Dal.Interfaces;
 using Sales.Dal.Options;
@@ -12,6 +13,7 @@ public class UnitOfWork : IUnitOfWork
     private readonly SqlConnection _connection;
     private readonly bool _ownsConnection;
     private readonly DalOptions _options;
+    private readonly Microsoft.Extensions.Logging.ILogger<UnitOfWork>? _logger;
     private SqlTransaction? _transaction;
 
     private IClientRepository? _clients;
@@ -19,7 +21,10 @@ public class UnitOfWork : IUnitOfWork
     private IProductRepository? _products;
     private ITeamMemberRepository? _teamMembers;
 
-    public UnitOfWork(string connectionString, IOptions<DalOptions>? options = null)
+    public UnitOfWork(
+        string connectionString,
+        IOptions<DalOptions>? options = null,
+        Microsoft.Extensions.Logging.ILogger<UnitOfWork>? logger = null)
     {
         if (string.IsNullOrWhiteSpace(connectionString))
         {
@@ -29,13 +34,18 @@ public class UnitOfWork : IUnitOfWork
         _connection = new SqlConnection(connectionString);
         _ownsConnection = true;
         _options = options?.Value ?? new DalOptions();
+        _logger = logger;
     }
 
-    public UnitOfWork(SqlConnection connection, DalOptions? options = null)
+    public UnitOfWork(
+        SqlConnection connection,
+        DalOptions? options = null,
+        Microsoft.Extensions.Logging.ILogger<UnitOfWork>? logger = null)
     {
         _connection = connection ?? throw new ArgumentNullException(nameof(connection));
         _ownsConnection = false;
         _options = options ?? new DalOptions();
+        _logger = logger;
     }
 
     public IClientRepository Clients => _clients ??= new ClientRepository(_connection, () => _transaction, _options);
@@ -61,6 +71,7 @@ public class UnitOfWork : IUnitOfWork
         }
 
         _transaction = (SqlTransaction)await _connection.BeginTransactionAsync(isolationLevel, ct);
+        _logger?.LogInformation("UnitOfWork: Transaction started with isolation level {IsolationLevel}", isolationLevel);
     }
 
     public async Task CommitAsync(CancellationToken ct = default)
@@ -73,6 +84,7 @@ public class UnitOfWork : IUnitOfWork
         try
         {
             await _transaction.CommitAsync(ct);
+            _logger?.LogInformation("UnitOfWork: Transaction committed successfully");
         }
         finally
         {
@@ -95,6 +107,7 @@ public class UnitOfWork : IUnitOfWork
             if (_transaction.Connection != null)
             {
                 await _transaction.RollbackAsync(ct);
+                _logger?.LogWarning("UnitOfWork: Transaction rolled back");
             }
         }
         catch (InvalidOperationException)
