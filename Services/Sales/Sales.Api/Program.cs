@@ -59,7 +59,8 @@ builder.Services.Configure<DalOptions>(builder.Configuration.GetSection("DalOpti
 builder.Services.AddScoped<IUnitOfWork>(sp =>
 {
     var options = sp.GetService<IOptions<DalOptions>>();
-    return new UnitOfWork(connectionString, options);
+    var logger = sp.GetService<ILogger<UnitOfWork>>();
+    return new UnitOfWork(connectionString, options, logger);
 });
 
 // Репозиторії з поточного Unit of Work для єдиного з'єднання в межах запиту

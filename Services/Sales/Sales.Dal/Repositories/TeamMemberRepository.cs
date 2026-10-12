@@ -1,3 +1,4 @@
+using Dapper;
 using Microsoft.Data.SqlClient;
 using Sales.Dal.Interfaces;
 using Sales.Dal.Options;
@@ -30,5 +31,25 @@ public class TeamMemberRepository : BaseDapperRepository<TeamMember>, ITeamMembe
             hasSoftDelete: true,
             options)
     {
+    }
+
+    /// <summary>
+    /// Специфічний Dapper-запит: пошук активного співробітника за Email
+    /// </summary>
+    public async Task<TeamMember?> GetByEmailAsync(string email, CancellationToken ct = default)
+    {
+        await EnsureOpenAsync(ct);
+
+        const string sql = "SELECT Id, FullName, Email, Role, IsActive, CreatedAt, CreatedBy, UpdatedAt, UpdatedBy, IsDeleted " +
+                           "FROM dbo.TeamMembers WHERE Email = @Email AND IsDeleted = 0;";
+
+        var cmd = new CommandDefinition(
+            sql,
+            new { Email = email },
+            transaction: Transaction,
+            commandTimeout: CommandTimeout,
+            cancellationToken: ct);
+
+        return await Connection.QuerySingleOrDefaultAsync<TeamMember>(cmd);
     }
 }
