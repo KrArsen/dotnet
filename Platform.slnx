@@ -1,6 +1,7 @@
 <Solution>
   <Folder Name="/Services/" />
   <Folder Name="/Services/Sales/">
+    <Project Path="Services/Sales/Sales.Bll/Sales.Bll.csproj" />
     <Project Path="Services/Sales/Sales.Dal/Sales.Dal.csproj" />
     <Project Path="Services/Sales/Sales.Domain/Sales.Domain.csproj" />
   </Folder>
