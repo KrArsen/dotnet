@@ -28,7 +28,7 @@ public class ApiIntegrationTests : IClassFixture<WebApplicationFactory<Program>>
             builder.ConfigureTestServices(services =>
             {
                 // Підміняємо бізнес-сервіси mock-об'єктами для детермінованого тестування HTTP-контракту,
-                // статус-кодів (400, 404, 409), ProblemDetails та CorrelationId
+                // статус-кодів (400, 404, 409, 500), ProblemDetails та CorrelationId
                 services.AddScoped(_ => _clientServiceMock);
                 services.AddScoped(_ => _dealServiceMock);
             });
@@ -93,20 +93,66 @@ public class ApiIntegrationTests : IClassFixture<WebApplicationFactory<Program>>
     }
 
     [Fact]
-    public async Task CreateClient_WithInvalidModel_Returns400WithValidationProblemDetails()
+    public async Task CreateClient_WithInvalidModel_Returns400AndDoesNotCallService()
     {
         // Arrange
+        _clientServiceMock.ClearReceivedCalls();
         var client = _factory.CreateClient();
         var invalidPayload = new { CompanyName = "", Email = "not-an-email" };
 
         // Act
         var response = await client.PostAsJsonAsync("/api/clients", invalidPayload);
 
-        // Assert
+        // Assert - Рівень 1 валідації: автоматичний 400 відхиляє запит ДО виклику сервісу
         response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
 
         var content = await response.Content.ReadAsStringAsync();
         content.Should().Contain("errors");
+
+        await _clientServiceMock.DidNotReceiveWithAnyArgs().CreateAsync(default!, default!, default);
+    }
+
+    [Fact]
+    public async Task CreateClient_WithO_Brien_Returns201Created()
+    {
+        // Arrange
+        var client = _factory.CreateClient();
+        var payload = new CreateClientDto
+        {
+            CompanyName = "O'Brien Tech LLC",
+            ContactPerson = "Patrick O'Brien",
+            Email = "obrien@tech.ua",
+            Phone = "+380509998877",
+            Industry = "IT"
+        };
+
+        var expectedDto = new ClientDto(
+            123L,
+            payload.CompanyName,
+            payload.ContactPerson,
+            payload.Email,
+            payload.Phone,
+            payload.Industry,
+            DateTime.UtcNow,
+            "system",
+            null,
+            null,
+            "AAAAAAAAB9Q=");
+
+        _clientServiceMock.CreateAsync(Arg.Any<CreateClientDto>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(expectedDto);
+
+        // Act
+        var response = await client.PostAsJsonAsync("/api/clients", payload);
+
+        // Assert
+        response.StatusCode.Should().Be(HttpStatusCode.Created);
+        response.Headers.Location.Should().NotBeNull();
+
+        var created = await response.Content.ReadFromJsonAsync<ClientDto>();
+        created.Should().NotBeNull();
+        created!.CompanyName.Should().Be("O'Brien Tech LLC");
+        created.ContactPerson.Should().Be("Patrick O'Brien");
     }
 
     [Fact]
@@ -132,6 +178,27 @@ public class ApiIntegrationTests : IClassFixture<WebApplicationFactory<Program>>
         problem.Title.Should().Be("Конфлікт бізнес-правил");
         problem.Detail.Should().Contain("Неможливо виграти угоду");
         problem.Extensions.Should().ContainKey("correlationId");
+    }
+
+    [Fact]
+    public async Task GetClient_WhenUnhandledExceptionOccurs_Returns500WithoutSqlLeak()
+    {
+        // Arrange
+        _clientServiceMock.GetByIdAsync(111L, Arg.Any<CancellationToken>())
+            .Returns<Task<ClientDto?>>(_ => Task.FromException<ClientDto?>(new Exception("Internal database connection failed: SELECT * FROM dbo.Clients WHERE Id = 111")));
+
+        var client = _factory.CreateClient();
+
+        // Act
+        var response = await client.GetAsync("/api/clients/111");
+
+        // Assert
+        response.StatusCode.Should().Be(HttpStatusCode.InternalServerError);
+        response.Content.Headers.ContentType?.MediaType.Should().Be("application/problem+json");
+
+        var content = await response.Content.ReadAsStringAsync();
+        content.Should().NotContain("SELECT * FROM dbo.Clients");
+        content.Should().Contain("Внутрішня помилка сервера");
     }
 
     [Fact]

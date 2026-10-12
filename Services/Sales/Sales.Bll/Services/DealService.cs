@@ -1,5 +1,6 @@
 using System.Data;
 using AutoMapper;
+using Microsoft.Extensions.Logging;
 using Sales.Bll.Dto;
 using Sales.Bll.Validation;
 using Sales.Dal.Interfaces;
@@ -27,12 +28,18 @@ public class DealService : IDealService
     private readonly IUnitOfWork _uow;
     private readonly IMapper _mapper;
     private readonly IDealValidator _validator;
+    private readonly ILogger<DealService>? _logger;
 
-    public DealService(IUnitOfWork uow, IMapper mapper, IDealValidator validator)
+    public DealService(
+        IUnitOfWork uow,
+        IMapper mapper,
+        IDealValidator validator,
+        ILogger<DealService>? logger = null)
     {
         _uow = uow ?? throw new ArgumentNullException(nameof(uow));
         _mapper = mapper ?? throw new ArgumentNullException(nameof(mapper));
         _validator = validator ?? throw new ArgumentNullException(nameof(validator));
+        _logger = logger;
     }
 
     public async Task<DealDto?> GetByIdAsync(long id, CancellationToken ct = default)
@@ -62,40 +69,74 @@ public class DealService : IDealService
 
     public async Task<DealDto> CreateAsync(CreateDealDto dto, string createdBy, CancellationToken ct = default)
     {
-        // Рівень 2: Бізнес-валідація
+        // Рівень 2: Бізнес-валідація перед транзакцією
         await _validator.ValidateCreateAsync(dto, ct);
 
-        var deal = new Deal
+        // Виконання створення агрегату в межах UoW-транзакції
+        await _uow.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
+        try
         {
-            Title = dto.Title,
-            ClientId = dto.ClientId,
-            OwnerId = dto.OwnerId,
-            CreatedBy = string.IsNullOrWhiteSpace(createdBy) ? "system" : createdBy
-        };
+            var deal = new Deal
+            {
+                Title = dto.Title,
+                ClientId = dto.ClientId,
+                OwnerId = dto.OwnerId,
+                CreatedBy = string.IsNullOrWhiteSpace(createdBy) ? "system" : createdBy
+            };
 
-        var details = new DealDetails
-        {
-            Source = dto.Source ?? "Inbound",
-            Description = dto.Description,
-            ExpectedCloseDate = dto.ExpectedCloseDate
-        };
+            var details = new DealDetails
+            {
+                Source = dto.Source ?? "Inbound",
+                Description = dto.Description,
+                ExpectedCloseDate = dto.ExpectedCloseDate
+            };
 
-        var items = dto.Items.Select(i => new DealItem
-        {
-            ProductId = i.ProductId,
-            Quantity = i.Quantity,
-            Discount = i.Discount
-        }).ToList();
+            var items = new List<DealItem>();
+            foreach (var itemDto in dto.Items)
+            {
+                // Читання товару/послуги з локальної копії каталогу
+                var product = await _uow.Products.GetByIdAsync(itemDto.ProductId, ct);
+                if (product == null || !product.IsActive)
+                {
+                    throw new BusinessConflictException(
+                        $"Product with ID {itemDto.ProductId} is not found or inactive in catalog copy.");
+                }
 
-        var newDealId = await _uow.Deals.CreateAsync(deal, details, items, ct);
+                if (itemDto.Discount > (product.Price * itemDto.Quantity))
+                {
+                    throw new ValidationException(
+                        $"Знижка {itemDto.Discount} грн перевищує повну вартість позиції {product.Price * itemDto.Quantity} грн для послуги '{product.Name}'.");
+                }
 
-        var created = await _uow.Deals.GetWithDetailsAsync(newDealId, ct);
-        if (created == null)
-        {
-            throw new InvalidOperationException("Failed to retrieve created deal.");
+                // знімок на момент додавання, політика дублювання Лаб. 01, не оновлюється
+                items.Add(new DealItem
+                {
+                    ProductId = product.Id,
+                    ProductName = product.Name,
+                    UnitPrice = product.Price,
+                    Quantity = itemDto.Quantity,
+                    Discount = itemDto.Discount,
+                    CreatedBy = string.IsNullOrWhiteSpace(createdBy) ? "system" : createdBy
+                });
+            }
+
+            var newDealId = await _uow.Deals.CreateAsync(deal, details, items, ct);
+            var created = await _uow.Deals.GetWithDetailsAsync(newDealId, ct);
+            if (created == null)
+            {
+                throw new InvalidOperationException("Failed to retrieve created deal.");
+            }
+
+            await _uow.CommitAsync(ct);
+            _logger?.LogInformation("Deal {DealId} created successfully in transaction", newDealId);
+            return _mapper.Map<DealDto>(created);
         }
-
-        return _mapper.Map<DealDto>(created);
+        catch (Exception ex)
+        {
+            _logger?.LogError(ex, "Failed to create deal, rolling back transaction");
+            await _uow.RollbackAsync(ct);
+            throw;
+        }
     }
 
     public async Task<bool> AddItemAsync(long dealId, AddDealItemDto dto, string addedBy, CancellationToken ct = default)
@@ -111,6 +152,21 @@ public class DealService : IDealService
             throw new BusinessConflictException($"Cannot add item to closed deal in stage '{deal.Stage}'.");
         }
 
+        // Перевірка та знімок товару з репліки Каталогу
+        var product = await _uow.Products.GetByIdAsync(dto.ProductId, ct);
+        if (product == null || !product.IsActive)
+        {
+            throw new BusinessConflictException(
+                $"Product with ID '{dto.ProductId}' not found or inactive in catalog copy.");
+        }
+
+        if (dto.Discount > (product.Price * dto.Quantity))
+        {
+            throw new ValidationException(
+                $"Знижка {dto.Discount} грн перевищує повну вартість позиції {product.Price * dto.Quantity} грн для послуги '{product.Name}'.");
+        }
+
+        // знімок на момент додавання, політика дублювання Лаб. 01, не оновлюється
         await _validator.ValidateAddItemAsync(dealId, dto, ct);
 
         return await _uow.Deals.AddItemAsync(
@@ -173,10 +229,12 @@ public class DealService : IDealService
 
             // 4. Фіксація транзакції
             await _uow.CommitAsync(ct);
+            _logger?.LogInformation("Deal {DealId} won successfully in dual-repo transaction for client {ClientId}", dealId, deal.ClientId);
             return true;
         }
-        catch
+        catch (Exception ex)
         {
+            _logger?.LogWarning(ex, "Rolling back WinDeal transaction for deal {DealId}", dealId);
             await _uow.RollbackAsync(ct);
             throw;
         }
@@ -188,6 +246,11 @@ public class DealService : IDealService
         if (deal == null || deal.IsDeleted)
         {
             throw new NotFoundException("Deal", dealId);
+        }
+
+        if (DealStatuses.IsClosed(deal.Stage))
+        {
+            throw new BusinessConflictException($"Cannot mark as lost deal in closed stage '{deal.Stage}'.");
         }
 
         return await _uow.Deals.LoseAsync(
@@ -205,6 +268,7 @@ public class DealService : IDealService
             throw new NotFoundException("Deal", id);
         }
 
+        // Перевірка бізнес-правила: виграну угоду не можна видалити
         _validator.ValidateDelete(deal);
 
         return await _uow.Deals.DeleteAsync(id, ct);

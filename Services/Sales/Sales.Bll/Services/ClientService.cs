@@ -21,12 +21,18 @@ public class ClientService : IClientService
     private readonly IUnitOfWork _uow;
     private readonly IMapper _mapper;
     private readonly IClientValidator _validator;
+    private readonly Microsoft.Extensions.Logging.ILogger<ClientService>? _logger;
 
-    public ClientService(IUnitOfWork uow, IMapper mapper, IClientValidator validator)
+    public ClientService(
+        IUnitOfWork uow,
+        IMapper mapper,
+        IClientValidator validator,
+        Microsoft.Extensions.Logging.ILogger<ClientService>? logger = null)
     {
         _uow = uow ?? throw new ArgumentNullException(nameof(uow));
         _mapper = mapper ?? throw new ArgumentNullException(nameof(mapper));
         _validator = validator ?? throw new ArgumentNullException(nameof(validator));
+        _logger = logger;
     }
 
     public async Task<ClientDto?> GetByIdAsync(long id, CancellationToken ct = default)
