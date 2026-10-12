@@ -449,9 +449,11 @@ Platform.slnx
   - Успадковують базовий клас `BaseDapperRepository<T>`.
   - Усі запити використовують `CommandDefinition` з передачею транзакції, таймауту та `CancellationToken`.
   - `DealRepository` викликає збережені процедури (`usp_CreateDeal`, `usp_AddDealItem`, `usp_AdvanceDealStage`, `usp_WinDeal`, `usp_LoseDeal`), читає множинні результати через `QueryMultipleAsync` (`usp_GetDealById`) та виконує пагіноване читання через представлення `vw_DealSummary`.
+  - `ProductRepository.GetActiveByNameAsync` виконує пошук з екрануванням спецсимволів LIKE (`[`, `%`, `_`). Операції додавання/модифікації (`AddAsync`, `UpdateAsync`, `DeleteAsync`) кидають `NotSupportedException`, оскільки сутність є локальною реплікою каталогу `CatalogDb` (політика дублювання Лаб. 01).
+  - `TeamMemberRepository.GetByEmailAsync` забезпечує типізований пошук співробітників за електронною поштою.
 - **Unit of Work (`UnitOfWork`):**
   - Гарантує роботу всіх репозиторіїв на **єдиному фізичному з'єднанні `SqlConnection`** у межах життєвого циклу HTTP-запиту (`Scoped`).
-  - Управління транзакціями: `BeginTransactionAsync`, `CommitAsync`, `RollbackAsync`.
+  - Управління транзакціями: `BeginTransactionAsync`, `CommitAsync`, `RollbackAsync` із детальним логуванням життєвого циклу через `ILogger<UnitOfWork>`.
   - Захист від пастки `XACT_ABORT ON` у SQL Server: перевірка `if (_transaction.Connection != null)` перед відкатом транзакції.
   - Реалізує `IAsyncDisposable`.
 - **Трансляція винятків (`SqlExceptionTranslator`):**
@@ -461,6 +463,7 @@ Platform.slnx
 
 ### 3.2. Рівень бізнес-логіки (Sales.Bll)
 - **DTO та AutoMapper:** Повна ізоляція внутрішніх сутностей від зовнішнього API (`ClientDto`, `DealDto`, `DealDetailsDto`, `DealItemDto`, `DealSummaryDto`, `DealStatsDto`, `ProductDto`, `TeamMemberDto`). Валідовано викликом `AssertConfigurationIsValid()`.
+- **Фіксація знімка цін та назв (Snapshot Pattern):** При створенні угоди (`CreateAsync`) та додаванні позицій (`AddItemAsync`) BLL вичитує дані товару з каталогу й явно копіює `product.Name` у `ProductName` та `product.Price` у `UnitPrice` (`// знімок на момент додавання, політика дублювання Лаб. 01, не оновлюється`). Створення угоди виконується всередині транзакції `UnitOfWork`.
 - **Валідація бізнес-правил (Рівень 2):** `ClientValidator` та `DealValidator` перевіряють стан агрегатів (активність клієнта/менеджера, непорожність позицій, відсутність дублювання ProductId у межах угоди, заборону модифікації закритих угод).
 - **Ідемпотентність:** `IIdempotencyStore` на базі `IMemoryCache` кешує відповіді за заголовком `Idempotency-Key` (TTL 24 години). Повторний запит із тим самим ключем повертає кешовану відповідь із заголовком `X-Cache-Lookup: HIT`.
 - **Атомарна бізнес-операція `WinDealAsync`:**
@@ -468,11 +471,12 @@ Platform.slnx
   - Якщо клієнт видалений або виникає конфлікт версій, обидві операції відкочуються через `uow.RollbackAsync()`, і стадія угоди повертається до початкової.
 
 ### 3.3. Рівень представлення (Sales.Api)
-- **Архітектурна ізоляція:** Контролери та Middleware **НЕ мають посилань `using Sales.Dal`**. Доступ до даних відбувається виключно через BLL-сервіси.
+- **Архітектурна ізоляція:** Контролери та Middleware **НЕ мають посилань `using Sales.Dal`**. Доступ до даних відбувається виключно через BLL-сервіси. `Sales.Api.csproj` посилається на `Sales.Bll` та `Sales.Domain` (DAL резолвиться транзитивно).
+- **Дворівнева валідація:** Рівень 1 (DataAnnotations) повертає 400 ProblemDetails на рівні фреймворку без виклику бізнес-сервісів; Рівень 2 (BLL валідатори) перевіряє стан доменних агрегатів.
 - **Маршрутизація:** Атрибутна маршрутизація (`[ApiController]`, `[Route("api/[controller]")]`).
 - **Асинхронність:** Усі екшени контролерів є асинхронними (`async/await`) та підтримують `CancellationToken`.
 - **Correlation ID Middleware:** Зчитує або генерує `X-Correlation-Id`, додає його у відповідь та пушить у Serilog `LogContext`.
-- **Централізований Exception Handler:** `DomainExceptionHandler` транслює винятки у формат `application/problem+json` з `traceId` та `correlationId`.
+- **Централізований Exception Handler:** `DomainExceptionHandler` транслює винятки у формат `application/problem+json` з `traceId` та `correlationId`. Безпечна обробка 500 без витоку деталей SQL.
 - **Swagger / OpenAPI:** Документація на `/swagger`, кореневий запит `/` автоматично перенаправляє на Swagger UI.
 
 ---
@@ -491,7 +495,9 @@ dotnet run --project Platform.AppHost
 За наявності локально запущеного SQL Server (наприклад, із портом 1433 за замовчуванням):
 
 ```bash
-# 1. Застосувати скрипти Лаб 01 до бази SalesDb (якщо ще не застосовані)
+# 1. За потреби налаштувати рядок підключення через User Secrets або змінну середовища:
+dotnet user-secrets set "ConnectionStrings:SalesDb" "Server=127.0.0.1,1433;Database=SalesDb;User Id=sa;Password=Your_Strong_Password_123!;TrustServerCertificate=True" --project Services/Sales/Sales.Api
+
 # 2. Запустити Sales.Api
 dotnet run --project Services/Sales/Sales.Api
 ```
@@ -626,9 +632,19 @@ curl -X GET http://localhost:5000/api/deals/stats
 curl -X GET http://localhost:5000/api/products
 ```
 
+**Пошук послуг/товарів за назвою (з безпечним екрануванням спецсимволів LIKE):**
+```bash
+curl -X GET "http://localhost:5000/api/products/search?name=SEO"
+```
+
 **Перелік співробітників:**
 ```bash
 curl -X GET http://localhost:5000/api/team-members
+```
+
+**Пошук співробітника за електронною поштою:**
+```bash
+curl -X GET "http://localhost:5000/api/team-members/by-email?email=alex@studio.ua"
 ```
 
 ---
@@ -695,20 +711,22 @@ curl -X GET http://localhost:5000/api/team-members
 Тестовий набір у `Services/Sales/Sales.Tests` покриває всі ключові сценарії та запускається командою:
 
 ```bash
-dotnet test
+dotnet test Platform.slnx
 ```
 
 ### Фактичний звіт тестування:
-- **Загальна кількість тестів:** 19
-- **Пройдено успішно:** 19
+- **Загальна кількість тестів:** 25
+- **Пройдено успішно:** 25
 - **Провалено:** 0
 - **Пропущено:** 0
 
 | Група тестів | Кількість | Перевірений функціонал |
 | :--- | :---: | :--- |
-| **`DealServiceTests`** | 4 | Успішна фіксація транзакції `WinDealAsync`; відкат транзакції при падінні другого репозиторію (`Clients`); валідація відсутності позицій; відкат при відсутності угоди. |
+| **`DealServiceTests`** | 5 | Успішна фіксація транзакції `WinDealAsync`; відкат транзакції при падінні другого репозиторію (`Clients`); валідація відсутності позицій; відкат при відсутності угоди; виконання `CreateDeal` у транзакції UoW та фіксація знімка назви й ціни. |
+| **`ProductRepositoryTests`** | 3 | Захист локальної репліки каталогу `CatalogDb`: методи `AddAsync`, `UpdateAsync`, `DeleteAsync` гарантовано викидають `NotSupportedException`. |
 | **`AutoMapperTests`** | 1 | Повна валідація профілів AutoMapper 16 (`AssertConfigurationIsValid`) для всіх сутностей та DTO. |
 | **`SqlExceptionTranslatorTests`** | 5 | Трансляція кодів 50001 (404), 50002 (409), 50005 (400), унікальних ключів 2601/2627 (409) та дедлоку 1205 (409). |
 | **`UnitOfWorkTests`** | 3 | Безпека подвійного `DisposeAsync`, безпека виклику `RollbackAsync` без транзакції, валідація порожнього рядка підключення. |
-| **`ApiIntegrationTests`** | 6 | Генерація та збереження `X-Correlation-Id`, повернення 400 ProblemDetails при помилках валідації, 404 ProblemDetails для відсутнього ресурсу, 409 ProblemDetails при конфлікті, доступність Swagger JSON. |
+| **`ApiIntegrationTests`** | 8 | Генерація та збереження `X-Correlation-Id`; валідація Рівня 1 (DataAnnotations) повертає 400 ProblemDetails без виклику BLL-сервісу; безпечна робота з апострофами у назвах клієнтів (O'Brien); 404 ProblemDetails для відсутнього ресурсу; 409 ProblemDetails при конфлікті; безпечна обробка 500 винятків без витоку SQL деталей; доступність Swagger JSON. |
+
 
