@@ -91,7 +91,11 @@ public class DomainExceptionHandler : IExceptionHandler
             validationProblem.Extensions["traceId"] = traceId;
             validationProblem.Extensions["correlationId"] = correlationId;
 
-            await httpContext.Response.WriteAsJsonAsync(validationProblem, cancellationToken: cancellationToken);
+            await httpContext.Response.WriteAsJsonAsync(
+                validationProblem,
+                options: (System.Text.Json.JsonSerializerOptions?)null,
+                contentType: "application/problem+json",
+                cancellationToken: cancellationToken);
         }
         else
         {
@@ -105,7 +109,11 @@ public class DomainExceptionHandler : IExceptionHandler
             problemDetails.Extensions["traceId"] = traceId;
             problemDetails.Extensions["correlationId"] = correlationId;
 
-            await httpContext.Response.WriteAsJsonAsync(problemDetails, cancellationToken: cancellationToken);
+            await httpContext.Response.WriteAsJsonAsync(
+                problemDetails,
+                options: (System.Text.Json.JsonSerializerOptions?)null,
+                contentType: "application/problem+json",
+                cancellationToken: cancellationToken);
         }
 
         return true;
