@@ -43,4 +43,12 @@ var salesApi = builder.AddProject<Projects.Sales_Api>("sales-api")
     .WithReference(salesDb)
     .WaitFor(salesDb);
 
+// База даних CatalogDb для мікросервісу Catalog (EF Core Code-First)
+var catalogDb = sqlServer.AddDatabase("CatalogDb");
+
+// Мікросервіс Catalog.Api зв'язується з базою CatalogDb
+var catalogApi = builder.AddProject<Projects.Catalog_Api>("catalog-api")
+    .WithReference(catalogDb)
+    .WaitFor(catalogDb);
+
 builder.Build().Run();
