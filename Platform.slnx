@@ -7,6 +7,12 @@
     <Project Path="Services/Sales/Sales.Dal/Sales.Dal.csproj" />
     <Project Path="Services/Sales/Sales.Domain/Sales.Domain.csproj" />
   </Folder>
+  <Folder Name="/Services/Catalog/">
+    <Project Path="Services/Catalog/Catalog.Api/Catalog.Api.csproj" />
+    <Project Path="Services/Catalog/Catalog.Bll/Catalog.Bll.csproj" />
+    <Project Path="Services/Catalog/Catalog.Dal/Catalog.Dal.csproj" />
+    <Project Path="Services/Catalog/Catalog.Domain/Catalog.Domain.csproj" />
+  </Folder>
   <Folder Name="/tests/">
     <Project Path="Services/Sales/Sales.Tests/Sales.Tests.csproj" />
   </Folder>
