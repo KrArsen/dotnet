@@ -45,6 +45,11 @@ public class GenericRepository<T> : IGenericRepository<T> where T : class
         DbSet.Remove(entity);
     }
 
+    public virtual IQueryable<T> WithSpecification(ISpecification<T> spec)
+    {
+        return ApplySpecification(spec);
+    }
+
     public virtual async Task<T?> GetBySpecAsync(ISpecification<T> spec, CancellationToken ct = default)
     {
         return await ApplySpecification(spec).FirstOrDefaultAsync(ct);

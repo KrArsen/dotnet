@@ -11,6 +11,7 @@ public interface IGenericRepository<T> where T : class
     void Delete(T entity);
 
     // Підтримка Specification pattern
+    IQueryable<T> WithSpecification(ISpecification<T> spec);
     Task<T?> GetBySpecAsync(ISpecification<T> spec, CancellationToken ct = default);
     Task<IReadOnlyList<T>> ListAsync(ISpecification<T> spec, CancellationToken ct = default);
     Task<int> CountAsync(ISpecification<T> spec, CancellationToken ct = default);

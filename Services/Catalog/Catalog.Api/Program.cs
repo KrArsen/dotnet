@@ -55,8 +55,8 @@ builder.Services.AddAutoMapper(cfg =>
     }
 }, typeof(CatalogMappingProfile).Assembly);
 
-// 7. Реєстрація FluentValidation валідаторів
-builder.Services.AddValidatorsFromAssemblyContaining<CreateProductDtoValidator>();
+// 7. Реєстрація FluentValidation валідаторів через AddValidatorsFromAssembly
+builder.Services.AddValidatorsFromAssembly(typeof(Catalog.Bll.Validation.CreateProductDtoValidator).Assembly);
 
 // 8. Реєстрація BLL-сервісів (з IMemoryCache декоратором для ProductService)
 builder.Services.AddScoped<ProductService>();
