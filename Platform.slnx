@@ -13,6 +13,12 @@
     <Project Path="Services/Catalog/Catalog.Dal/Catalog.Dal.csproj" />
     <Project Path="Services/Catalog/Catalog.Domain/Catalog.Domain.csproj" />
   </Folder>
+  <Folder Name="/Services/Activities/">
+    <Project Path="Services/Activities/Activities.Domain/Activities.Domain.csproj" />
+    <Project Path="Services/Activities/Activities.Application/Activities.Application.csproj" />
+    <Project Path="Services/Activities/Activities.Infrastructure/Activities.Infrastructure.csproj" />
+    <Project Path="Services/Activities/Activities.WebApi/Activities.WebApi.csproj" />
+  </Folder>
   <Folder Name="/tests/">
     <Project Path="Services/Sales/Sales.Tests/Sales.Tests.csproj" />
   </Folder>
