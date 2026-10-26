@@ -1,0 +1,125 @@
+@baseUrl = http://localhost:5002
+
+### 1. Health Check
+GET {{baseUrl}}/health
+Accept: application/json
+
+### 2. Отримати список активностей (пагінація, сортування за датою, кешування)
+GET {{baseUrl}}/api/activities?page=1&pageSize=5
+Accept: application/json
+
+### 3. Фільтрація за типом активності (лише дзвінки)
+GET {{baseUrl}}/api/activities?type=call&page=1&pageSize=10
+Accept: application/json
+
+### 4. Фільтрація за клієнтом (АгроТрейд Захід, ClientId=1)
+GET {{baseUrl}}/api/activities?clientId=1&page=1&pageSize=10
+Accept: application/json
+
+### 5. Отримати активність за фіксованим ObjectId (перевірка ETag заголовка)
+GET {{baseUrl}}/api/activities/653000000000000000000001
+Accept: application/json
+
+### 6. Створити нову активність (201 Created + Location header)
+# @name createActivity
+POST {{baseUrl}}/api/activities
+Content-Type: application/json
+
+{
+  "type": "call",
+  "clientId": 3,
+  "clientName": "Ресторан «Mon Ami»",
+  "authorUserId": 3,
+  "authorDisplayName": "Сергій Бондаренко",
+  "text": "Обговорили оновлення меню та запуск таргетованої реклами.",
+  "rating": 5,
+  "direction": "outbound",
+  "durationSec": 280,
+  "outcome": "Клієнт погодив бюджет"
+}
+
+### 7. Негативний сценарій: Створення з некоректним рейтингом (HTTP 400 ValidationProblemDetails)
+POST {{baseUrl}}/api/activities
+Content-Type: application/json
+
+{
+  "type": "call",
+  "clientId": 3,
+  "clientName": "Ресторан «Mon Ami»",
+  "authorUserId": 4,
+  "authorDisplayName": "Марина Савченко",
+  "text": "Дзвінок з невалідним рейтингом",
+  "rating": 10
+}
+
+### 8. Негативний сценарій: Заборонений тип 'fax' (HTTP 400 DomainException)
+POST {{baseUrl}}/api/activities
+Content-Type: application/json
+
+{
+  "type": "fax",
+  "clientId": 1,
+  "clientName": "ТОВ «АгроТрейд Захід»",
+  "authorUserId": 1,
+  "authorDisplayName": "Андрій Мельник",
+  "text": "Спроба відправити факс"
+}
+
+### 9. Додати коментар команди до активності
+POST {{baseUrl}}/api/activities/653000000000000000000001/comments
+Content-Type: application/json
+
+{
+  "author": "Марина Савченко",
+  "text": "Додатково погодили дату першого релізу на наступну п'ятницю."
+}
+
+### 10. Оновити активність з актуальним If-Match (HTTP 204 NoContent)
+PUT {{baseUrl}}/api/activities/653000000000000000000001
+Content-Type: application/json
+If-Match: "1"
+
+{
+  "text": "Оновлений підсумок розмови: клієнт затвердив структуру каталогу та хостинг.",
+  "rating": 5,
+  "outcome": "Успішно погоджено"
+}
+
+### 11. Оновити активність із застарілим If-Match (HTTP 409 Conflict)
+PUT {{baseUrl}}/api/activities/653000000000000000000001
+Content-Type: application/json
+If-Match: "999"
+
+{
+  "text": "Спроба оновлення із невідповідною версією",
+  "rating": 4
+}
+
+### 12. Неіснуючий ID активності (HTTP 404 NotFound)
+GET {{baseUrl}}/api/activities/653000000000000000000999
+Accept: application/json
+
+### 13. Невалідний формат ObjectId (HTTP 400 ProblemDetails)
+GET {{baseUrl}}/api/activities/invalid-object-id
+Accept: application/json
+
+### 14. Отримати список відгуків через контролер Reviews
+GET {{baseUrl}}/api/reviews?page=1&pageSize=10
+Accept: application/json
+
+### 15. Створити відгук на товар через контролер Reviews (201 Created + Location)
+POST {{baseUrl}}/api/reviews
+Content-Type: application/json
+
+{
+  "productId": 2,
+  "productName": "Корпоративний сайт",
+  "authorUserId": 5,
+  "authorDisplayName": "Ігор Ковальчук",
+  "text": "Дуже задоволені якістю розробки та швидкістю завантаження сторінок!",
+  "rating": 5
+}
+
+### 16. Отримати відгук за ID через контролер Reviews
+GET {{baseUrl}}/api/reviews/653000000000000000000001
+Accept: application/json
