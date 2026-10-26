@@ -1,5 +1,9 @@
 namespace Activities.Application.Common.Models;
 
+public record AuthorDto(long UserId, string DisplayName);
+
+public record RelatedProductDto(long ProductId, string Name);
+
 public record CommentDto(
     string Author,
     string Text,
@@ -21,7 +25,8 @@ public record ActivityDto(
     DateTime CreatedAt,
     DateTime? UpdatedAt,
     string? Outcome = null,
-    IReadOnlyList<CommentDto>? Comments = null);
+    IReadOnlyList<CommentDto>? Comments = null,
+    IReadOnlyList<RelatedProductDto>? RelatedProducts = null);
 
 /// <summary>
 /// Аліас DTO відгуку для сумісності з автоперевіркою за моделлю Reviews
