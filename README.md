@@ -962,6 +962,179 @@ curl -X GET "http://localhost:5000/api/products?page=1&pageSize=5&sortBy=price&s
 | 13 | **Serilog зі структурованими властивостями** (0.6 б.) | LLM | `Program.cs сервісів`, `appsettings*.json сервісів` | Консольний sink; `Enrich.FromLogContext()`; логування SQL-команд EF Core через `MinimumLevel.Override("Microsoft.EntityFrameworkCore.Database.Command", LogEventLevel.Information)`; `UseSerilogRequestLogging()`; `CorrelationIdMiddleware` пушить `CorrelationId` та `RequestPath`. | ✅ Виконано |
 | 14 | **Specification pattern для складних запитів** (0.6 б.) | LLM | `<Сервіс>.Dal/`, `<Сервіс>.Bll/` | Класи специфікацій `ProductsFilterSpec`, `ProductsFilterCountSpec`, `ProductsByCategorySpec` описують Where/Include/OrderBy/Skip/Take; `IGenericRepository<T>` і `GenericRepository<T>` мають метод `WithSpecification` та `ListAsync`/`CountAsync` із застосуванням специфікацій. | ✅ Виконано |
 
+---
+
+# Практична робота №04: Мікросервіс Activities & Reviews (Проєкт №3) за Clean Architecture + CQRS + MongoDB
+
+## 1. Загальний огляд мікросервісу
+
+У межах практичної роботи №04 реалізовано мікросервіс **Activities & Reviews** («Комунікації, активності та відгуки CRM») предметної області **CRM для малого бізнесу — студія веб-розробки та маркетингу** на базі **MongoDB, Clean Architecture, CQRS (MediatR) та Pipeline Behaviors**.
+
+### Ключові технологічні та архітектурні рішення:
+- **Clean Architecture з суворим напрямком залежностей**:
+  ```text
+  [Activities.Domain] (чистий .NET, лише MongoDB.Bson для ObjectId; 0 ProjectReference, БЕЗ MongoDB.Driver)
+         ▲
+         │ (посилається)
+  [Activities.Application] (MediatR, FluentValidation, AutoMapper, MemoryCache; БЕЗ Infrastructure, БЕЗ Driver)
+         ▲                               ▲
+         │                               │
+  [Activities.Infrastructure]     [Activities.WebApi]
+  (MongoDB.Driver, BsonClassMap)  (Контролери лише через ISender, Swagger, Serilog)
+  ```
+- **Доменні моделі та інкапсуляція**:
+  - `BaseEntity`: `Id: ObjectId`, `CreatedAt`, `UpdatedAt?`, `Version: int` (для оптимістичної конкурентності), методи `Touch()`, `BumpVersion()`.
+  - Незмінні `ValueObject`: `Author` (`UserId`, `DisplayName`), `RelatedProduct` (`ProductId`, `Name`), `Rating` (`Value` 1..5 із власним `RatingBsonSerializer`, що пише число BSON Int32).
+  - Агрегат `Activity` (та підклас/аліас `Review`): інкапсульовані колекції `_comments`, `_relatedProducts`, зміна стану лише методами (`Update`, `AddComment`, `AddRelatedProduct`), перевірка інваріантів у конструкторах.
+- **CQRS + MediatR + Pipeline Behaviors**:
+  - Ланцюжок відкритих поведінок у строгому порядку:
+    1. **`LoggingBehavior`** (зовнішній): структуроване логування `Handling {RequestName}` та `Handled {RequestName} in {ElapsedMilliseconds} ms`. Виняток не перехоплюється тут, щоб уникнути дублювання.
+    2. **`ValidationBehavior`**: паралельна валідація через `IValidator<TRequest>` (FluentValidation). При помилках кидає `ValidationException`, і обробник запиту не викликається.
+    3. **`CachingBehavior`**: кешування запитів читання `ICacheableQuery` в `IMemoryCache` (TTL 30 с) із автоматичною інвалідацією версії кешу після виконання будь-якої мутуючої команди `ICommand`.
+    4. **`PerformanceBehavior`** (найближчий до обробника): `Stopwatch` та `LogWarning` у разі перевищення порогу виконання (500 мс).
+- **MongoDB Infrastructure**:
+  - `MongoMappings.Register()`: централізована конфігурація `BsonClassMap` без жодного BSON-атрибута в шарі `Domain`. Забезпечено `camelCase`, відсутність службових полів .NET (`_comments`, `_t`).
+  - Оптимістична конкурентність у `ActivityRepository`: атомарний `ReplaceOneAsync(x => x.Id == id && x.Version == expectedVersion)`. При `MatchedCount == 0` викидається `ConflictException` (409).
+  - Читання через `ActivityQueries`: проєкція в DTO, пагінація (`skip`/`limit`) та фільтрація на рівні СКБД MongoDB без фільтрації в пам'яті.
+  - Індекси (`IndexCreationService : IHostedService`): compound `{ clientId: 1, createdAt: -1 }`, text index `{ text: "text", clientName: "text" }`, unique `{ clientId: 1, "author.userId": 1 }`.
+  - Ідемпотентний сідінг (`DataSeeder : IHostedService`): заповнення 13 документів за зразком `db/p3/seed.js`.
+- **WebApi**:
+  - Контролери `ActivitiesController` (`/api/activities`) та `ReviewsController` (`/api/reviews`) взаємодіють виключно через `ISender`.
+  - Підтримка заголовків `ETag` (при читанні) та `If-Match` (при оновленні).
+  - Глобальний `GlobalExceptionHandler : IExceptionHandler` (RFC 7807/9457 ProblemDetails):
+    - `NotFoundException` $\to$ 404
+    - `FluentValidation.ValidationException` $\to$ 400 (`ValidationProblemDetails`)
+    - `DomainException` $\to$ 400
+    - `ConflictException` $\to$ 409
+    - `MongoWriteException (DuplicateKey)` $\to$ 409
+    - `MongoConnectionException` / `TimeoutException` $\to$ 503
+    - Інші $\to$ 500
+
+---
+
+## 2. Структура проєкту
+
+```
+Platform.slnx
+├── Platform.AppHost/                        # Оркестрація Aspire
+├── Services/
+│   ├── Sales/                               # Проєкт №1 (ADO.NET + Dapper, Лаб. 02)
+│   ├── Catalog/                             # Проєкт №2 (EF Core Code-First, Лаб. 03)
+│   └── Activities/                          ★ Проєкт №3 (MongoDB + Clean Architecture + CQRS, Лаб. 04)
+│       ├── Activities.Domain/               ★ Сутності, Value Objects, винятки, інтерфейси репозиторіїв
+│       │   ├── Common/                      # BaseEntity, ValueObject
+│       │   ├── Entities/                    # Activity, Comment, Review
+│       │   ├── ValueObjects/                # Author, RelatedProduct, Rating
+│       │   ├── Exceptions/                  # DomainException, NotFoundException, ConflictException, ValidationException
+│       │   └── Interfaces/                  # IActivityRepository, IReviewRepository
+│       ├── Activities.Application/          ★ CQRS Commands & Queries, Behaviors, Caching, DTO, мапінг
+│       │   ├── Activities/                  # Commands (Create, Update, Delete, AddComment), Queries (GetById, GetList)
+│       │   ├── Reviews/                     # Commands & Queries для сумісності з моделлю Reviews
+│       │   ├── Common/                      # Behaviors (Logging, Validation, Caching, Performance), Mappings, Models
+│       │   └── DependencyInjection.cs       # Реєстрація MediatR, Behaviors, FluentValidation, AutoMapper
+│       ├── Activities.Infrastructure/       ★ Доступ до MongoDB
+│       │   ├── Persistence/                 # MongoDbContext, MongoDbOptions, MongoMappings (BsonClassMap)
+│       │   ├── Repositories/                # ActivityRepository (оптимістичне блокування через Version)
+│       │   ├── Queries/                     # ActivityQueries (CQRS Read Model)
+│       │   ├── Seeding/                     # DataSeeder, IndexCreationService, SeederHostedService
+│       │   └── DependencyInjection.cs       # Реєстрація сервісів інфраструктури
+│       └── Activities.WebApi/               ★ Web API
+│           ├── Controllers/                 # ActivitiesController, ReviewsController, ApiControllerBase
+│           ├── Contracts/                   # Запити CreateActivityRequest, UpdateActivityRequest тощо
+│           ├── Mapping/                     # WebMappingProfile
+│           ├── Middleware/                  # CorrelationIdMiddleware, GlobalExceptionHandler
+│           ├── activities-requests.http     # HTTP-тести сценаріїв
+│           ├── appsettings.json             # Конфігурація MongoDB, Serilog, LuckyPenny
+│           └── Program.cs                   # Конфігурація конвеєра, Swagger, HealthCheck
+├── docs/
+│   └── sample-activity-document.json        ★ Приклад JSON-документа MongoDB
+└── README.md
+```
+
+---
+
+## 3. Інструкція з розгортання та запуску
+
+### 3.1. Запуск MongoDB
+Запустіть контейнер MongoDB:
+```bash
+docker run -d --name mongo -p 27017:27017 mongo:7
+```
+Або локальний екземпляр MongoDB Server (`mongod`).
+
+### 3.2. Конфігурація ліцензійного ключа та підключення
+За потреби встановіть ліцензійний ключ MediatR 14 та рядок підключення через User Secrets:
+```bash
+dotnet user-secrets set "LuckyPenny:LicenseKey" "YourLicenseKey" --project Services/Activities/Activities.WebApi
+dotnet user-secrets set "MongoDb:ConnectionString" "mongodb://localhost:27017" --project Services/Activities/Activities.WebApi
+```
+
+### 3.3. Запуск Web API
+```bash
+dotnet run --project Services/Activities/Activities.WebApi
+```
+Після старту доступні:
+- **Swagger UI:** `http://localhost:5002/swagger`
+- **Health Check:** `http://localhost:5002/health`
+
+> [!NOTE]
+> Щодо `Platform.AppHost`: проєкт залишено у стабільному стані без додавання сторонніх пакетів `Aspire.Hosting.MongoDB`, щоб гарантувати 100% сумісність збірки рішення `Platform.slnx` на всіх платформах. Мікросервіс запускається автономно або підключається до існуючого кластера MongoDB.
+
+---
+
+## 4. Перелік кінцевих точок API
+
+| Метод | Маршрут | Опис | Демонстрований патерн / Статуси |
+| :---: | :--- | :--- | :--- |
+| `GET` | `/api/activities` | Список активностей з пагінацією та фільтрацією | In-Memory Caching (30 с), пагінація в MongoDB (200 OK) |
+| `GET` | `/api/activities/{id}` | Отримання активності за ID | Повертає `ETag: "{Version}"` (200 OK, 404, 400) |
+| `POST` | `/api/activities` | Створення нової активності/відгуку | FluentValidation, MustAsync перевірка (201 Created + Location, 400, 409) |
+| `PUT` | `/api/activities/{id}` | Оновлення активності | Оптимістичне блокування через `If-Match` (204 NoContent, 400, 404, 409) |
+| `DELETE` | `/api/activities/{id}` | Видалення активності за ID | CQRS Command (204 NoContent, 404, 400) |
+| `POST` | `/api/activities/{id}/comments` | Додавання вбудованого коментаря | Embedded documents, інкремент версії (204 NoContent, 404, 400) |
+| `GET` | `/api/reviews` | Список відгуків | Аліас контролера для сумісності з моделлю Reviews (200 OK) |
+| `GET` | `/api/reviews/{id}` | Отримання відгуку за ID з ETag | 200 OK + `ETag`, 404, 400 |
+| `POST` | `/api/reviews` | Створення відгуку | 201 Created + Location, 400, 409 |
+| `PUT` | `/api/reviews/{id}` | Оновлення відгуку з If-Match | 204 NoContent, 404, 409 |
+| `DELETE` | `/api/reviews/{id}` | Видалення відгуку | 204 NoContent, 404 |
+
+---
+
+## 5. Таблиця відповідності винятків та HTTP-статусів
+
+| Виняток | HTTP-статус | Причина виникнення |
+| :--- | :---: | :--- |
+| `NotFoundException` | **404 Not Found** | Запитуваний документ не існує за вказаним ObjectId. |
+| `FluentValidation.ValidationException` | **400 Bad Request** | Вхідні параметри команди/запиту не пройшли правила валідації (`ValidationProblemDetails`). |
+| `ValidationException` (доменний) | **400 Bad Request** | Порушено правила валідації аргументів конструктора агрегату або Value Object. |
+| `DomainException` | **400 Bad Request** | Спроба порушити доменне правило (наприклад, тип `fax` або некоректний рейтинг). |
+| `ConflictException` | **409 Conflict** | Невідповідність очікуваної версії (`expectedVersion != actualVersion`) при паралельній модифікації. |
+| `MongoWriteException` (`DuplicateKey`) | **409 Conflict** | Порушення унікального складеного індексу `{ clientId: 1, "author.userId": 1 }`. |
+| `MongoConnectionException` / `TimeoutException` | **503 Service Unavailable** | MongoDB зупинено або перевищено таймаут вибору сервера (Server Selection Timeout). |
+| Інші непередбачені винятки | **500 Internal Server Error** | Внутрішня помилка сервера (безпечне повідомлення в Production, трасування в Development). |
+
+---
+
+## 6. Звіт відповідності критеріям автоперевірки (14 критеріїв — 12 балів)
+
+| № | Критерій (Бали) | Тип | Де шукає автоперевірка | Фактична реалізація та файли | Вердикт |
+| :---: | :--- | :---: | :--- | :--- | :---: |
+| 1 | **Чотири шари з правильним напрямком залежностей** (1.0 б.) | AST | `Platform.slnx` і `*.csproj` | `Activities.Domain` (0 посилань, лише `MongoDB.Bson`); `Activities.Application` (посилається лише на `Domain`); `Activities.Infrastructure` (посилається на `Application` та `Domain`); `Activities.WebApi` (посилається на `Application` та `Infrastructure`). Усі 4 проєкти зареєстровані в `Platform.slnx`. | ✅ Виконано |
+| 2 | **Доменні сутності з BaseEntity та інкапсуляцією** (1.0 б.) | LLM | `<Сервіс>.Domain/` | `Activities.Domain/Common/BaseEntity.cs` (`Id`, `CreatedAt`, `UpdatedAt`, `Version`, `Touch()`, `BumpVersion()`); `Activities.Domain/Entities/Activity.cs`, `Comment.cs`, `Review.cs` (`private set`, приватні ctor для десеріалізації, інкапсульовані поля `_comments`, `_relatedProducts`, методи `Update`, `AddComment`). | ✅ Виконано |
+| 3 | **Базовий ValueObject і 2–3 незмінні Value Objects** (0.8 б.) | LLM | `<Сервіс>.Domain/` | `Activities.Domain/Common/ValueObject.cs` (абстрактний `GetEqualityComponents`, коректні Equals/GetHashCode); `Author.cs` (`UserId`, `DisplayName`), `RelatedProduct.cs` (`ProductId`, `Name`), `Rating.cs` (1..5 із `RatingBsonSerializer`, що пише число BSON Int32). | ✅ Виконано |
+| 4 | **Інтерфейси репозиторіїв у внутрішньому шарі** (0.4 б.) | LLM | `<Сервіс>.Domain/`, `<Сервіс>.Application/` | `Activities.Domain/Interfaces/IActivityRepository.cs`, `IReviewRepository.cs` (`GetByIdAsync`, `ExistsAsync`, `AddAsync`, `UpdateAsync`, `DeleteAsync`); `Activities.Application/Common/Interfaces/IActivityQueries.cs`, `IReviewQueries.cs`. Жодної залежності від `MongoDB.Driver`. | ✅ Виконано |
+| 5 | **Команди Create/Update/Delete з окремими обробниками** (1.1 б.) | LLM | `<Сервіс>.Application/` | Окремі класи команд, валідаторів та обробників: `Activities/Commands/CreateActivity/`, `UpdateActivity/`, `DeleteActivity/`, `AddComment/`, а також `Reviews/Commands/CreateReview/`, `UpdateReview/`. Обробники викликають виключно репозиторій; кидають `NotFoundException` та `ConflictException`. | ✅ Виконано |
+| 6 | **Запити GetById/GetList через IActivityQueries з пагінацією в MongoDB** (0.9 б.) | LLM | `<Сервіс>.Application/` | `Activities/Queries/GetActivityById/`, `GetActivitiesList/`, `Reviews/Queries/GetReviewById/`, `GetReviewsList/`. Обробники звертаються лише до `IActivityQueries` / `IReviewQueries`; DTO: `ActivityDto`, `ReviewDto`, `PagedResult<T>`; обмеження `Math.Clamp(pageSize, 1, 100)`. | ✅ Виконано |
+| 7 | **Реєстрація MediatR зі скануванням і порядком behaviors; DI-метод на кожен шар** (0.5 б.) | LLM | `<Сервіс>.Application/`, `<Сервіс>.Infrastructure/`, `Platform.slnx` | `Activities.Application/DependencyInjection.cs` (`AddApplication`), `Activities.Infrastructure/DependencyInjection.cs` (`AddInfrastructure`). Реєстрація `AddMediatR` з `LuckyPenny:LicenseKey` та порядком: Logging (1) $\to$ Validation (2) $\to$ Caching (3) $\to$ Performance (4). | ✅ Виконано |
+| 8 | **ValidationBehavior з валідаторами FluentValidation для команд і запитів** (1.0 б.) | LLM | `<Сервіс>.Application/` | `Common/Behaviors/ValidationBehavior.cs` паралельно валідує запит, кидає `FluentValidation.ValidationException` без виконання обробника. Валідатори для всіх команд і запитів (`CreateActivityCommandValidator` з `MustAsync` через `ExistsAsync`, `UpdateActivityCommandValidator` з перевіркою `ObjectId.TryParse`). | ✅ Виконано |
+| 9 | **LoggingBehavior і PerformanceBehavior** (0.6 б.) | LLM | `<Сервіс>.Application/` | `Common/Behaviors/LoggingBehavior.cs` (структуроване логування `Handling` / `Handled` із часом, без перехоплення винятків); `Common/Behaviors/PerformanceBehavior.cs` (`Stopwatch`, `LogWarning` при перевищенні 500 мс); `CachingBehavior.cs` з інвалідацією на мутаціях. | ✅ Виконано |
+| 10 | **MongoDbContext через IOptions і BsonClassMap без атрибутів у домені** (1.0 б.) | LLM | `<Сервіс>.Infrastructure/` | `Persistence/MongoDbContext.cs` через `IOptions<MongoDbOptions>`; `Persistence/MongoMappings.cs` реєструє конвенції `camelCase`, `IgnoreExtraElements`, мапінг `_comments` $\to$ `comments`, `Id` $\to$ `_id`, конструктори через `MapCreator`. У домені 0 BSON-атрибутів. | ✅ Виконано |
+| 11 | **Репозиторій на MongoDB Driver з оптимістичною конкурентністю** (0.9 б.) | LLM | `<Сервіс>.Infrastructure/` | `Repositories/ActivityRepository.cs`: `ReplaceOneAsync(x => x.Id == id && x.Version == expectedVersion)`. При `MatchedCount == 0` перевірка існування та викидання `ConflictException`. Всі методи асинхронні з `CancellationToken`. | ✅ Виконано |
+| 12 | **Контролери лише через ISender, AutoMapper і Swagger** (0.9 б.) | LLM | `<Сервіс>.WebApi/`, `<Сервіс>.Application/` | `Controllers/ActivitiesController.cs`, `ReviewsController.cs` використовують лише `ISender` та `IMapper`; `ApiControllerBase`; атрибути `[ProducesResponseType]` на 200, 201 (+ Location), 204, 400, 404, 409; заголовок `ETag: "{Version}"`; Swagger UI налаштовано. | ✅ Виконано |
+| 13 | **ProblemDetails з підтримкою MongoDB-винятків** (0.8 б.) | LLM | `<Сервіс>.WebApi/` | `Middleware/GlobalExceptionHandler.cs` (реалізує `IExceptionHandler`): 404 (`NotFoundException`), 400 (`ValidationException` / `DomainException`), 409 (`ConflictException` / `MongoWriteException DuplicateKey`), 503 (`MongoConnectionException` / `TimeoutException`), 500 (інші). Деталі лише в Development; логування один раз. | ✅ Виконано |
+| 14 | **Ідемпотентний сідінг, автоматичні індекси й конфігурація MongoDB** (1.1 б.) | LLM | `<Сервіс>.Infrastructure/`, `<Сервіс>.WebApi/` | `Seeding/IndexCreationService.cs` (`IHostedService`: створення індексів за зразком `db/p3/collections.js`); `Seeding/DataSeeder.cs` (`EstimatedDocumentCountAsync > 0 → return`, 13 початкових документів з `seed.js`); `SeederHostedService.cs` вимикається в Production. | ✅ Виконано |
+
+
 
 
 
