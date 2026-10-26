@@ -1,0 +1,107 @@
+### 1. Отримати список позицій з пагінацією (Page 1, Size 5)
+GET http://localhost:5000/api/products?page=1&pageSize=5
+Accept: application/json
+
+### 2. Отримати наступну сторінку позицій (Page 2, Size 5)
+GET http://localhost:5000/api/products?page=2&pageSize=5
+Accept: application/json
+
+### 3. Фільтрація прайс-листа за діапазоном цін та типом
+GET http://localhost:5000/api/products?minPrice=10000&maxPrice=30000&itemType=Service&sortBy=price&sortDir=asc
+Accept: application/json
+
+### 4. Пошук послуги/товару за назвою або артикулом SKU
+GET http://localhost:5000/api/products?search=SEO
+Accept: application/json
+
+### 5. Отримати повну картку товару за ID (демонстрація Eager Loading: Product + Detail + Images + Categories)
+GET http://localhost:5000/api/products/1
+Accept: application/json
+
+### 6. Створити нову позицію каталогу (201 Created + Location)
+POST http://localhost:5000/api/products
+Content-Type: application/json
+X-User: manager@studio.ua
+
+{
+  "sku": "SRV-TEST-99",
+  "name": "Нова послуга аудиту кібербезпеки",
+  "itemType": "Service",
+  "price": 32000.00,
+  "stockQuantity": 15,
+  "description": "Комплексне тестування на проникнення та аудит серверної безпеки",
+  "unit": "проєкт",
+  "durationMinutes": 2400,
+  "taxRate": 20.00,
+  "categoryIds": [1, 2]
+}
+
+### 7. Негативний тест валідації (400 ValidationProblemDetails) - порожня назва та від'ємна ціна
+POST http://localhost:5000/api/products
+Content-Type: application/json
+
+{
+  "sku": "SRV-INVALID",
+  "name": "",
+  "itemType": "Service",
+  "price": -100.00,
+  "stockQuantity": 0
+}
+
+### 8. Негативний тест унікальності (409 Conflict) - спроба створити дублікат існуючого SKU
+POST http://localhost:5000/api/products
+Content-Type: application/json
+
+{
+  "sku": "SRV-LAND-01",
+  "name": "Дублікат послуги лендінгу",
+  "itemType": "Service",
+  "price": 25000.00,
+  "stockQuantity": 5
+}
+
+### 9. Негативний тест отримання неіснуючого ресурсу (404 ProblemDetails)
+GET http://localhost:5000/api/products/999999
+Accept: application/json
+
+### 10. Зміна ціни позиції каталогу (204 No Content)
+PUT http://localhost:5000/api/products/1/price
+Content-Type: application/json
+X-User: owner@studio.ua
+
+{
+  "newPrice": 27000.00,
+  "reason": "Планова індексація вартості розробки лендінгу"
+}
+
+### 11. Списання залишку товару зі складу (204 No Content)
+POST http://localhost:5000/api/products/9/stock/remove
+Content-Type: application/json
+
+{
+  "quantity": 5
+}
+
+### 12. Негативний тест списання більшого залишку ніж є в наявності (409 Conflict - DomainException)
+POST http://localhost:5000/api/products/9/stock/remove
+Content-Type: application/json
+
+{
+  "quantity": 99999
+}
+
+### 13. М'яке видалення позиції каталогу (204 No Content)
+DELETE http://localhost:5000/api/products/1
+X-User: owner@studio.ua
+
+### 14. Отримати список категорій (200 OK)
+GET http://localhost:5000/api/categories
+Accept: application/json
+
+### 15. Отримати категорію з товарами (демонстрація Explicit Loading: 2 окремих SQL-запити)
+GET http://localhost:5000/api/categories/1/products
+Accept: application/json
+
+### 16. Отримати нещодавно додані товари категорії (демонстрація LINQ M:N через проміжну таблицю та AddedAt)
+GET http://localhost:5000/api/categories/recent-products?categoryName=Веб-розробка
+Accept: application/json

@@ -729,4 +729,217 @@ dotnet test Platform.slnx
 | **`UnitOfWorkTests`** | 3 | Безпека подвійного `DisposeAsync`, безпека виклику `RollbackAsync` без транзакції, валідація порожнього рядка підключення. |
 | **`ApiIntegrationTests`** | 8 | Генерація та збереження `X-Correlation-Id`; валідація Рівня 1 (DataAnnotations) повертає 400 ProblemDetails без виклику BLL-сервісу; безпечна робота з апострофами у назвах клієнтів (O'Brien); 404 ProblemDetails для відсутнього ресурсу; 409 ProblemDetails при конфлікті; безпечна обробка 500 винятків без витоку SQL деталей; доступність Swagger JSON. |
 
+---
+
+# Практична робота №03: Мікросервіс Catalog на EF Core Code-First
+
+## 1. Загальний огляд мікросервісу Catalog
+
+У межах практичної роботи №03 реалізовано мікросервіс **Catalog** («Каталог послуг та цифрових товарів») предметної області **CRM для малого бізнесу — студія веб-розробки та маркетингу** на базі **Entity Framework Core 10 Code-First**.
+
+Мікросервіс реалізує чисту тришарову архітектурну вертикаль:
+$$\text{Catalog.Dal} \longrightarrow \text{Catalog.Bll} \longrightarrow \text{Catalog.Api} \quad (\text{зі спільним ядром } \text{Catalog.Domain})$$
+
+### Ключові технологічні особливості:
+- **EF Core 10 Code-First**: доменні моделі з інкапсульованими бізнес-правилами (`private set`, перевірки інваріантів у конструкторах та методах).
+- **Fluent API**: повна конфігурація сутностей через окремі класи `IEntityTypeConfiguration<T>` у папці `Configurations/`, зареєстровані централізовано через `ApplyConfigurationsFromAssembly`.
+- **Зв'язки сутностей**:
+  - **1:1**: `Product` $\leftrightarrow$ `ProductDetail` (первинний ключ `ProductId` є одночасно зовнішнім ключем, `ON DELETE CASCADE`).
+  - **1:N**: `Product` $\to$ `ProductImage` та `Product` $\to$ `PriceHistory` (`ON DELETE CASCADE`).
+  - **M:N**: `Product` $\leftrightarrow$ `Category` через явну проміжну сутність `ProductCategory` зі складеним первинним ключем `{ ProductId, CategoryId }` та власним бізнес-полем `AddedAt` (`DATETIME2 DEFAULT SYSUTCDATETIME()`).
+- **Патерни Repository та Unit of Work**:
+  - `GenericRepository<T>` на `DbSet<T>` з асинхронними методами `GetByIdAsync`, `GetAllAsync`, `AddAsync` та синхронними `Update`, `Delete`.
+  - **Eager Loading**: `ProductRepository.GetWithDetailsAsync` підвантажує всі зв'язки за один мережевий круг (`Include`/`ThenInclude`).
+  - **Explicit Loading**: `CategoryRepository.GetWithProductsAsync` виконує два окремих SQL-запити (вибірка категорії + явне завантаження через `Entry().Collection().LoadAsync()`).
+  - **LINQ to Entities M:N**: `ProductCategoryRepository.GetRecentlyAddedAsync` здійснює вибірку через навігаційні властивості та фільтрацію за `AddedAt`.
+  - `UnitOfWork` із єдиною точкою збереження `SaveChangesAsync()` та підтримкою транзакцій.
+- **Specification Pattern**: класи специфікацій на базі `Ardalis.Specification` (`ProductsFilterSpec`, `ProductsFilterCountSpec`, `ProductsByCategorySpec`) застосовуються через загальні методи репозиторію без дублювання логіки.
+- **Дворівнева валідація**:
+  - Рівень 1: DataAnnotations на DTO (прості атрибути).
+  - Рівень 2: FluentValidation (`CreateProductDtoValidator` тощо) з явним викликом `validator.ValidateAsync` у контролерах.
+- **ProblemDetails (RFC 7807 / 9457)**: централізований `GlobalExceptionHandler : IExceptionHandler` транслює винятки у стандартні відповіді 400, 404, 409, 500 із `traceId` та `correlationId`.
+- **Кешування**: `CachedProductService` (декоратор `IMemoryCache` над `IProductService`) кешує запити читання з автоматичною інвалідацією при мутаціях.
+- **Структуроване логування Serilog**: перехоплення команд EF Core (`Microsoft.EntityFrameworkCore.Database.Command`), наскрізний `X-Correlation-Id`.
+
+---
+
+## 2. Структура проєктів рішення
+
+```
+Platform.slnx
+├── Platform.AppHost/                        # .NET Aspire (оркестрація контейнера SQL Server + Sales.Api + Catalog.Api)
+├── Services/Sales/                          # Проєкт №1: мікросервіс Sales (ADO.NET + Dapper, Лаб. 02)
+├── Services/Catalog/                        # ★ Проєкт №2: мікросервіс Catalog (EF Core Code-First, Лаб. 03)
+│   ├── Catalog.Domain/                      # Доменні моделі, бізнес-методи, винятки (чистий .NET, 0 залежностей)
+│   │   ├── Entities/                        # Product, Category, ProductDetail, ProductImage, ProductCategory, PriceHistory
+│   │   └── Exceptions/                      # DomainException, EntityNotFoundException, ConflictException, ValidationException
+│   ├── Catalog.Dal/                         # Рівень доступу до даних (EF Core 10 SqlServer)
+│   │   ├── Context/                         # AppDbContext
+│   │   ├── Configurations/                  # 6 окремих IEntityTypeConfiguration<T> + HasData для Category
+│   │   ├── Migrations/                      # InitialCreate міграція та ModelSnapshot
+│   │   ├── Interfaces/                      # IGenericRepository, IProductRepository, ICategoryRepository, IProductCategoryRepository, IUnitOfWork
+│   │   ├── Repositories/                    # GenericRepository, ProductRepository, CategoryRepository, ProductCategoryRepository
+│   │   ├── UnitOfWork/                      # UnitOfWork
+│   │   └── Seeding/                         # Ідемпотентний DbInitializer
+│   ├── Catalog.Bll/                         # Рівень бізнес-логіки
+│   │   ├── DTOs/                            # ProductDto, CreateProductDto, UpdatePriceDto, RemoveStockDto, PagedResult тощо
+│   │   ├── Mapping/                         # AutoMapper Profile (CatalogMappingProfile)
+│   │   ├── Specifications/                  # ProductsFilterSpec, ProductsFilterCountSpec, ProductsByCategorySpec
+│   │   ├── Services/                        # IProductService, ProductService, ICategoryService, CategoryService
+│   │   └── Caching/                         # CachedProductService (IMemoryCache decorator)
+│   └── Catalog.Api/                         # ASP.NET Core Web API
+│       ├── Controllers/                     # ProductsController, CategoriesController
+│       ├── Validators/                      # FluentValidation класи (CreateProductDtoValidator тощо)
+│       ├── Middleware/                      # CorrelationIdMiddleware, GlobalExceptionHandler
+│       ├── catalog-requests.http            # HTTP-файли для тестування ендпоінтів
+│       ├── Dockerfile                       # Багатоетапна збірка Docker (контекст - корінь репозиторію)
+│       └── Program.cs                       # Налаштування DI, Serilog, Swagger, міграцій та сідінгу
+├── db/p2/
+│   ├── schema.sql                           # DDL Лаб 01 (реляційний еталон)
+│   ├── seed.sql                             # Початкові дані Лаб 01
+│   └── ef_initial_create.sql                # ★ Згенерований скрипт початкової міграції EF Core
+└── README.md
+```
+
+---
+
+## 3. Запуск проєкту та застосування міграцій
+
+### 3.1. Застосування міграцій EF Core до бази даних
+
+Для створення чи оновлення бази даних `CatalogDb` на базі міграцій виконайте:
+
+```bash
+dotnet ef database update --project Services/Catalog/Catalog.Dal --startup-project Services/Catalog/Catalog.Api
+```
+
+Генерація повторного SQL-скрипту міграції:
+```bash
+dotnet ef migrations script --project Services/Catalog/Catalog.Dal --startup-project Services/Catalog/Catalog.Api --output db/p2/ef_initial_create.sql
+```
+
+### 3.2. Автономний запуск Catalog.Api
+
+1. Налаштуйте рядок підключення до локального SQL Server (якщо відрізняється від типового):
+```bash
+dotnet user-secrets set "ConnectionStrings:CatalogDb" "Server=127.0.0.1,1433;Database=CatalogDb;User Id=sa;Password=Your_Strong_Password_123!;TrustServerCertificate=True" --project Services/Catalog/Catalog.Api
+```
+
+2. Запустіть мікросервіс:
+```bash
+dotnet run --project Services/Catalog/Catalog.Api
+```
+
+API буде доступний за адресою:
+- Swagger UI: `http://localhost:5000/swagger`
+- HTTP ендпоінт: `http://localhost:5000`
+
+### 3.3. Запуск через .NET Aspire
+Оркестратор автоматично запускає SQL Server 2022 у контейнері та підключає обидва мікросервіси (`sales-api` та `catalog-api`):
+```bash
+dotnet run --project Platform.AppHost
+```
+
+---
+
+## 4. Конфігурація AutoMapper та сідінгу
+
+### 4.1. Ліцензійний ключ AutoMapper
+AutoMapper 16 підтримує встановлення ліцензійного ключа через конфігурацію:
+```bash
+# Через User Secrets для розробки:
+dotnet user-secrets set "AutoMapper:LicenseKey" "YourLicenseKey" --project Services/Catalog/Catalog.Api
+
+# Або через змінну оточення:
+export AutoMapper__LicenseKey="YourLicenseKey"
+```
+У `appsettings.json` за замовчуванням встановлено placeholder:
+```json
+"AutoMapper": {
+  "LicenseKey": "AutoMapperCommunityLicenseKey"
+}
+```
+
+### 4.2. Вимкнення сідінгу в Production
+Програмний сідінг у `Program.cs` виконується виключно в середовищах розробки:
+```csharp
+if (!app.Environment.IsProduction())
+{
+    await DbInitializer.SeedAsync(db, logger);
+}
+```
+Щоб повністю вимкнути сідінг, встановіть змінну оточення `ASPNETCORE_ENVIRONMENT=Production`. Повторний запуск застосунку в режимі Development не дублює дані завдяки перевірці `if (await context.Products.AnyAsync()) return;`.
+
+---
+
+## 5. Перелік кінцевих точок API (Catalog Endpoints)
+
+| Метод | Маршрут | Опис | Демонстрований патерн / Рівень |
+| :---: | :--- | :--- | :--- |
+| `GET` | `/api/products` | Пагінований список товарів (повертає заголовок `X-Pagination` та тіло) | Пагінація, фільтри, сортування на рівні SQL (Ardalis.Specification) |
+| `GET` | `/api/products/{id}` | Повна картка товару з деталями, картинками та категоріями | **Eager Loading** (`ProductRepository.GetWithDetailsAsync`) |
+| `POST` | `/api/products` | Створення товару з перевіркою унікальності SKU (201 Created + Location) | FluentValidation + BLL унікальність |
+| `PUT` | `/api/products/{id}/price` | Зміна ціни товару з фіксацією в `PriceHistory` (204 No Content) | Інкапсульоване бізнес-правило сутності |
+| `POST` | `/api/products/{id}/stock/remove` | Списання залишку товару зі складу (204 No Content) | Інкапсульоване бізнес-правило (при нестачі $\to$ 409 Conflict) |
+| `POST` | `/api/products/{id}/stock/add` | Поповнення залишку товару на складі (204 No Content) | Інкапсульоване бізнес-правило |
+| `DELETE` | `/api/products/{id}` | М'яке видалення товару (Soft Delete, 204 No Content) | Unit of Work |
+| `GET` | `/api/products/by-category/{categoryId}` | Вибірка товарів певної категорії | Альтернативна специфікація `ProductsByCategorySpec` |
+| `GET` | `/api/categories` | Список активних категорій послуг та товарів (200 OK) | Generic Repository |
+| `GET` | `/api/categories/{id}` | Отримання категорії за ID (200 OK) | Generic Repository |
+| `GET` | `/api/categories/{id}/products` | Отримання категорії з товарами (2 окремих SQL-запити) | **Explicit Loading** (`CategoryRepository.GetWithProductsAsync`) |
+| `GET` | `/api/categories/recent-products` | Нещодавно додані товари за назвою категорії та датою `since` | **LINQ to Entities M:N** через поле `AddedAt` |
+| `POST` | `/api/categories` | Створення нової категорії (201 Created + Location) | FluentValidation + Unit of Work |
+
+---
+
+## 6. Приклади HTTP-запитів та ProblemDetails
+
+Готовий файл із усіма сценаріями розміщено в [`Services/Catalog/Catalog.Api/catalog-requests.http`](Services/Catalog/Catalog.Api/catalog-requests.http).
+
+### Приклад 1: Пагінація з сортуванням
+```bash
+curl -X GET "http://localhost:5000/api/products?page=1&pageSize=5&sortBy=price&sortDir=asc" -H "Accept: application/json"
+```
+**Заголовок відповіді `X-Pagination`:**
+```json
+{"TotalCount":10,"Page":1,"PageSize":5,"TotalPages":2,"HasNext":true,"HasPrevious":false}
+```
+
+### Приклад 2: Помилка валідації (HTTP 400 ValidationProblemDetails)
+**Запит:** `POST /api/products` із порожньою назвою та від'ємною ціною.
+```json
+{
+  "type": "https://tools.ietf.org/html/rfc9110#section-15.5.1",
+  "title": "Помилка валідації вхідних даних",
+  "status": 400,
+  "detail": "Одне або декілька полів не пройшли валідацію.",
+  "instance": "/api/products",
+  "errors": {
+    "Name": [
+      "Назва позиції каталогу є обов'язковою."
+    ],
+    "Price": [
+      "Ціна має бути строго більшою за 0."
+    ]
+  },
+  "traceId": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+  "correlationId": "d3b07384-d113-4638-b7d6-3e4293f92e9a"
+}
+```
+
+### Приклад 3: Конфлікт бізнес-правил (HTTP 409 Conflict)
+**Запит:** `POST /api/products/9/stock/remove` зі списанням кількості `99999` (більше за наявний залишок).
+```json
+{
+  "type": "https://tools.ietf.org/html/rfc9110#section-15.5.10",
+  "title": "Порушення доменного правила",
+  "status": 409,
+  "detail": "Недостатній залишок на складі для товару 'Пакет хостингу та SSL-сертифікат на 1 рік'. Доступно: 200, запитано: 99999.",
+  "instance": "/api/products/9/stock/remove",
+  "traceId": "00-9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d-9988776655443322-01",
+  "correlationId": "e1f2a3b4-c5d6-4e7f-8a9b-0c1d2e3f4a5b"
+}
+```
+
+
 
