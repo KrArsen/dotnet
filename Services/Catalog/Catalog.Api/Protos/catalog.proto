@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+option csharp_namespace = "Catalog.Grpc";
+package catalog;
+
+service CatalogService {
+  rpc GetProduct (GetProductRequest) returns (ProductReply);
+  rpc GetProductsByIds (GetProductsByIdsRequest) returns (ProductsReply);
+}
+
+message GetProductRequest {
+  int64 id = 1;
+}
+
+message GetProductsByIdsRequest {
+  repeated int64 ids = 1;
+}
+
+message ProductReply {
+  int64 id = 1;
+  string sku = 2;
+  string name = 3;
+  string item_type = 4;
+  double price = 5;
+  int32 stock_quantity = 6;
+  bool is_active = 7;
+  string description = 8;
+  string unit = 9;
+}
+
+message ProductsReply {
+  repeated ProductReply items = 1;
+}

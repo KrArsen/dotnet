@@ -1,4 +1,5 @@
 using System.Reflection;
+using Activities.Application.Caching;
 using Activities.Application.Common.Behaviors;
 using Activities.Application.Common.Caching;
 using FluentValidation;
@@ -13,9 +14,11 @@ public static class DependencyInjection
     {
         var assembly = Assembly.GetExecutingAssembly();
 
-        // 1. Кешування в оперативній пам'яті та провайдер версії для інвалідації
-        services.AddMemoryCache();
+        // 1. Дворівневе кешування: L1 (IMemoryCache з обмеженням SizeLimit) + провайдер версії для інвалідації
+        services.AddMemoryCache(o => o.SizeLimit = 10_000);
         services.AddSingleton<ICacheVersionProvider, CacheVersionProvider>();
+        services.AddSingleton<ReviewsCacheMetrics>();
+        services.AddScoped<ReviewsTwoLevelCacheService>();
 
         // 2. Валідатори FluentValidation
         services.AddValidatorsFromAssembly(assembly);

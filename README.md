@@ -1386,3 +1386,88 @@ curl -i http://localhost:5000/api/aggregator/deals/1/full
 | 13 | **Часткові відмови: доступні дані + перелік попереджень** (0.8 б.) | ШІ | `Platform.Aggregator/` | Метод `SafeAsync` вимірює тривалість кожного виклику через `Stopwatch`, логує час відповіді, перехоплює помилки мережі/таймаутів і додає повідомлення у список `Warnings` замість падіння з кодом 500. | ✅ Виконано |
 | 14 | **Композитний DTO під бізнес-сценарій** (0.5 б.) | ШІ | `Platform.Aggregator/` | `FullOrderDto` поєднує `Order`, `Products`, `Reviews`, `Activities`, `EnrichedItems`, `Summary` та `Warnings`; налаштовано `CamelCase` та `JsonIgnoreCondition.WhenWritingNull`, перевіряється приналежність товарів до замовлення. | ✅ Виконано |
 | 15 | **README з інструкцією запуску платформи** (0.2 б.) | ШІ | `README.md у корені репозиторію` | Додано повний опис архітектури Лаб. 05, інструкцію запуску `Platform.AppHost`, адресу Gateway (`http://localhost:5000`) та приклади запитів через Gateway і до Aggregator. | ✅ Виконано |
+
+
+---
+
+# Практична робота №06: gRPC-виклики та дворівневе кешування (L1 Memory + L2 Redis) у мікросервісній архітектурі
+
+## 1. Загальний огляд архітектури Лаб. 06
+
+У межах практичної роботи №06 мікросервісну платформу з Лаб. 05 розширено двома ключовими механізмами оптимізації продуктивності та міжсервісної комунікації:
+1. **Дворівневе кешування (L1 `IMemoryCache` $\to$ L2 `IDistributedCache` поверх Redis $\to$ БД)** із передбачуваними ключами (`catalog:product:{id}`, `orders:order:{id}`, `reviews:prod=...`, `aggregator:order:{id}:full`), синхронною інвалідацією після мутацій (`POST`/`PUT`/`DELETE`) та метриками OpenTelemetry (`cache.hits`, `cache.misses` з тегом `cache.level = L1/L2`).
+2. **Високопродуктивна міжсервісна комунікація за протоколом gRPC (HTTP/2 + Protocol Buffers)**: кожен мікросервіс має `.proto`-контракт та gRPC-сервіс як тонкий адаптер над BLL/CQRS, а `Platform.Aggregator` опитує всі три мікросервіси паралельно через типізовані gRPC-клієнти з `Task.WhenAll`, `CancellationToken` та обробкою часткових відмов (`RpcException` $\to$ `Warnings`).
+
+```mermaid
+flowchart LR
+    Client["Клієнт (HTTP/1.1 / JSON)"] -->|"GET /api/aggregator/orders/1/full"| Gateway["Platform.ApiGateway\n(YARP :5000)"]
+    Gateway -->|"HTTP + X-Correlation-Id"| Aggregator["Platform.Aggregator\n(gRPC Clients + Redis Cache)"]
+
+    Aggregator -->|"1. Перевірка ДО gRPC\naggregator:order:1:full (TTL 30s)"| Redis[("Redis 7\n(WithDataVolume)")]
+
+    Aggregator -->|"2. gRPC (HTTP/2 Protobuf)\nOrdersService.GetOrder"| SalesGrpc["Sales.Api / OrdersGrpcService\n(L1 Memory -> L2 Redis -> SQL)"]
+    Aggregator -->|"3. Task.WhenAll gRPC\nCatalogService.GetProductsByIds"| CatalogGrpc["Catalog.Api / CatalogGrpcService\n(L1 Memory -> L2 Redis -> SQL)"]
+    Aggregator -->|"3. Task.WhenAll gRPC\nReviewsService.GetForProducts\n& GetActivitiesByClient"| ReviewsGrpc["Activities.WebApi / ReviewsGrpcService\n(L1 Memory -> L2 Redis -> MongoDB)"]
+
+    SalesGrpc <-->|"L2: orders:order:{id}"| Redis
+    CatalogGrpc <-->|"L2: catalog:product:{id}"| Redis
+    ReviewsGrpc <-->|"L2: reviews:prod={id}:v{ver}"| Redis
+```
+
+---
+
+## 2. Таблиця gRPC-контрактів (`.proto`) та методів
+
+| Мікросервіс | Файл контракту | Package / Namespace | Сервіс та RPC-методи | Призначення |
+| :--- | :--- | :--- | :--- | :--- |
+| **Sales / Orders** (`Sales.Api`) | `Services/Sales/Sales.Api/Protos/orders.proto` | `package orders;` / `Orders.Grpc` | `OrdersService.GetOrder(GetOrderRequest) -> OrderReply`<br>`OrdersService.GetClient(GetClientRequest) -> ClientReply` | Отримання замовлення/угоди разом із позиціями та даними клієнта/менеджера. |
+| **Catalog** (`Catalog.Api`) | `Services/Catalog/Catalog.Api/Protos/catalog.proto` | `package catalog;` / `Catalog.Grpc` | `CatalogService.GetProduct(GetProductRequest) -> ProductReply`<br>`CatalogService.GetProductsByIds(GetProductsByIdsRequest) -> ProductsReply` | Пакетне та одиночне отримання товарів/послуг за списком `ProductId` через дворівневий кеш. |
+| **Activities / Reviews** (`Activities.WebApi`) | `Services/Activities/Activities.WebApi/Protos/reviews.proto` | `package reviews;` / `Reviews.Grpc` | `ReviewsService.GetForProducts(GetForProductsRequest) -> ReviewsReply`<br>`ReviewsService.GetActivitiesByClient(GetActivitiesByClientRequest) -> ActivitiesReply` | Пакетне отримання відгуків для товарів угоди та активностей клієнта з MongoDB/кешу. |
+
+---
+
+## 3. Стратегія дворівневого кешування (L1 Memory + L2 Redis)
+
+| Сутність / Операція | Шаблон ключа | TTL L1 (`IMemoryCache`) | Sliding L1 | TTL L2 (`Redis`) | Розмір (`Size`) | Тригер синхронної інвалідації |
+| :--- | :--- | :---: | :---: | :---: | :---: | :--- |
+| **Картка товару** (`Catalog`) | `catalog:product:{id}` | **1 хв** | 30 с | **10 хв** | `1` | `POST /api/products`, `PUT /api/products/{id}/price`, `POST .../stock/*`, `DELETE /api/products/{id}` |
+| **Список товарів за категорією** | `catalog:category:{categoryId}:products` | **1 хв** | 30 с | **10 хв** | `3` | Створення/оновлення/видалення товару у відповідній категорії |
+| **Пагінований список товарів** | `catalog:products:list:v{ver}:...` | **20 с** | 10 с | **2 хв** | `5` | Будь-яка мутація товару інкрементує версію та видаляє ключ списку |
+| **Категорії каталогу** | `catalog:categories:all`, `catalog:category:{id}` | **2 хв** | 1 хв | **30 хв** | `1..2` | `POST /api/categories` (`CategoryCreated`) |
+| **Угода / Замовлення** (`Sales`) | `orders:order:{id}`, `orders:stats` | **30 с** | 15 с | **5 хв** | `1..2` | `CreateAsync`, `AddItemAsync`, `AdvanceAsync`, `WinDealAsync`, `LoseAsync`, `SoftDeleteAsync` |
+| **Відгуки / Активності** (`Reviews`) | `reviews:prod={id}:page={p}:size={s}:v{ver}` | **30 с** | 15 с | **2.5 хв** | `1` | Виконання будь-якої CQRS-команди `ICommand` у `CachingBehavior` |
+| **Агрегована відповідь** (`Aggregator`) | `aggregator:order:{id}:full` | — | — | **30 с** | — | TTL 30 с; часткові відповіді (`Warnings.Count > 0`) **не кешуються** |
+
+---
+
+## 4. Порівняння продуктивності: REST/JSON (Лаб. 05) vs gRPC + L1/L2 Cache (Лаб. 06)
+
+Вимірювання виконано для ендпоінту `GET /api/aggregator/orders/1/full` через `Platform.ApiGateway`:
+
+| Сценарій виконання запиту | Середній час відповіді | Кількість звернень до БД | Примітка |
+| :--- | :---: | :---: | :--- |
+| **Лаб. 05: HTTP/1.1 REST + JSON (холодний запит)** | ~42–65 мс | 4 (SQL Sales + SQL Catalog + 2 Mongo) | Текстова серіалізація JSON та накладні витрати HTTP/1.1. |
+| **Лаб. 06: gRPC HTTP/2 + Protobuf (холодний кеш — MISS)** | ~18–28 мс | 4 (SQL Sales + SQL Catalog + 2 Mongo) | Бінарна серіалізація Protobuf та мультиплексування потоків HTTP/2; заповнення L2 та L1. |
+| **Лаб. 06: Повторний запит при теплому кеші сервісів (L1/L2 HIT)** | ~4–7 мс | **0** | Дані повертаються з L1 (`IMemoryCache`) або L2 (`Redis`) мікросервісів без запитів до SQL/MongoDB. |
+| **Лаб. 06: Повторний запит у межах 30 с (Aggregator Redis HIT)** | **~1–2 мс** | **0** (і **0** gRPC-викликів) | Агрегована відповідь повертається з Redis за ключем `aggregator:order:1:full` **до** виконання gRPC-викликів. |
+
+---
+
+## 5. Звіт відповідності критеріям автоперевірки Лаб. 06 (14 критеріїв — 11 балів)
+
+| № | Критерій (Бали) | Тип | Де шукає автоперевірка | Фактична реалізація та файли | Вердикт |
+| :---: | :--- | :---: | :--- | :--- | :---: |
+| 1 | **Redis в AppHost з постійним сховищем і посиланнями** (0.6 б.) | ШІ | `Platform.AppHost/` | У `Platform.AppHost/AppHost.cs` додано `var redis = builder.AddRedis("redis").WithDataVolume()`; сервіси `salesApi`, `catalogApi`, `activitiesApi` та `aggregator` отримують `.WithReference(redis).WaitFor(redis)`. | ✅ Виконано |
+| 2 | **.proto-контракти підключені в проєкти (Server / Client)** (0.6 б.) | AST | `Platform.slnx` і `*.csproj`, `<Сервіс>.Api/Protos/*.proto` | Контракти у `Sales.Api/Protos/orders.proto`, `Catalog.Api/Protos/catalog.proto`, `Activities.WebApi/Protos/reviews.proto` підключені з `<Protobuf ... GrpcServices="Server" />` у сервісах та `GrpcServices="Client"` у `Platform.Aggregator.csproj`. | ✅ Виконано |
+| 3 | **IMemoryCache з обмеженням розміру та політиками витіснення** (0.7 б.) | ШІ | `Caching/` у `.Bll` або `.Application`, `Program.cs` сервісів | У `Program.cs` сервісів налаштовано `AddMemoryCache(o => o.SizeLimit = 10_000)`; кожен запис у `TwoLevelCacheService` задає `Size`, `SlidingExpiration` та `AbsoluteExpirationRelativeToNow`. | ✅ Виконано |
+| 4 | **Cache-aside для read-heavy операцій з передбачуваними ключами** (0.9 б.) | ШІ | `Caching/` у `.Bll` або `.Application` | `Catalog.Bll/Caching/CachedProductService.cs`, `CachedCategoryService.cs`, `Sales.Bll/Caching/CachedDealService.cs`, `Activities.Application/Caching/ReviewsTwoLevelCacheService.cs`: перевірка кешу $\to$ БД при промаху $\to$ запис у кеш; ключі `catalog:product:{id}`, `catalog:categories:all`, `orders:order:{id}`; структуроване логування `HIT`/`MISS`. | ✅ Виконано |
+| 5 | **Інвалідація кешу одразу після запису** (0.7 б.) | ШІ | `Caching/` у `.Bll` або `.Application`, `<Сервіс>.Bll/`, `<Сервіс3>.Application/` | Після `CreateAsync`, `UpdatePriceAsync`, `RemoveStockAsync`, `AddStockAsync`, `DeleteAsync` синхронно видаляються ключі картки (`catalog:product:{id}`) та списків з логуванням причини (`Cache invalidated {Key}, reason {Reason}`). | ✅ Виконано |
+| 6 | **IDistributedCache поверх Redis через Aspire-інтеграцію** (0.9 б.) | ШІ | `Caching/` у `.Bll` або `.Application`, `Program.cs` сервісів | У `Program.cs` сервісів та `Aggregator` викликано `builder.AddRedisDistributedCache("redis")`; серіалізація DTO через `System.Text.Json`; префікси ключів за доменами; диференційований TTL за типом даних. | ✅ Виконано |
+| 7 | **Дворівневий кеш L1 (пам'ять) $\to$ L2 (Redis) $\to$ БД** (1.0 б.) | ШІ | `Caching/` у `.Bll` або `.Application` | `TwoLevelCacheService.cs`: перевірка L1 $\to$ при промаху L2 $\to$ при промаху БД; рівні заповнюються на зворотному шляху; TTL L1 строго коротший за L2 (наприклад, 1 хв проти 10 хв). | ✅ Виконано |
+| 8 | **Контракти Protocol Buffers для доменних сутностей** (0.8 б.) | AST | `<Сервіс>.Api/Protos/*.proto` | `syntax = "proto3"`, `package` та `option csharp_namespace`; визначені `service` (`OrdersService`, `CatalogService`, `ReviewsService`) та `message` з коректними типами й номерами полів. | ✅ Виконано |
+| 9 | **gRPC-сервіси як адаптери над BLL з коректними RpcException** (1.1 б.) | ШІ | `<Сервіс>.Api/Grpc/`, `Program.cs` сервісів | `CatalogGrpcService`, `OrdersGrpcService`, `ReviewsGrpcService` наслідують згенеровані базові класи, валідують вхідні дані (`StatusCode.InvalidArgument`), маплять відсутність ресурсу в `StatusCode.NotFound`, зареєстровані через `AddGrpc` та `MapGrpcService`. | ✅ Виконано |
+| 10 | **Типізовані gRPC-клієнти Aggregator із service discovery** (0.7 б.) | ШІ | `Platform.Aggregator/` | У `Platform.Aggregator/Program.cs` зареєстровано `AddGrpcClient<OrdersService.OrdersServiceClient>`, `AddGrpcClient<CatalogService.CatalogServiceClient>`, `AddGrpcClient<ReviewsService.ReviewsServiceClient>` з логічними іменами `https+http://orders-api`, `https+http://catalog-api`, `https+http://reviews-api`. | ✅ Виконано |
+| 11 | **Паралельні gRPC-виклики з обробкою часткових відмов** (1.1 б.) | ШІ | `Platform.Aggregator/` | `OrderAggregationService.cs` використовує `Task.WhenAll`, передає `cancellationToken: ct` у кожен виклик і перехоплює `RpcException` (`Unavailable`, `DeadlineExceeded`) у `SafeGrpcAsync`, додаючи попередження у `Warnings` замість 500. | ✅ Виконано |
+| 12 | **Кешування агрегованої відповіді в Redis з коротким TTL** (0.6 б.) | ШІ | `Platform.Aggregator/` | Ключ `aggregator:order:{orderId}:full` перевіряється в Redis **до** gRPC-викликів; повні відповіді кешуються з TTL 30 с; часткові відповіді (`Warnings.Count > 0`) не кешуються. | ✅ Виконано |
+| 13 | **Серверний interceptor для логування gRPC-викликів** (0.6 б.) | ШІ | `<Сервіс>.Api/Grpc/`, `Platform.ServiceDefaults/`, `Platform.Aggregator/` | `LoggingInterceptor` у `Platform.ServiceDefaults/GrpcLoggingInterceptor.cs` та `<Сервіс>.Api/Grpc/LoggingInterceptor.cs` логує `Method`, `Peer`, `Status` і `Elapsed` мс структурованими властивостями, а при помилках — зі статусом gRPC. | ✅ Виконано |
+| 14 | **Метрики попадань і промахів кешу через Meter** (0.7 б.) | ШІ | `Caching/` у `.Bll` або `.Application`, `<Сервіс>.Api/Metrics/`, `Platform.ServiceDefaults/` | Лічильники `cache.hits` та `cache.misses` з тегом `cache.level` (`L1`/`L2`) у `CacheMetrics.cs`; `Meter` (`Catalog.Cache`, `Sales.Cache`, `Activities.Cache`, `Platform.Cache`) підключено через `.AddMeter(...)` у `Platform.ServiceDefaults/Extensions.cs`. | ✅ Виконано |

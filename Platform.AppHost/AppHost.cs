@@ -1,7 +1,7 @@
 var builder = DistributedApplication.CreateBuilder(args);
 
 // ============================================================================
-// 2.1. Контейнери баз даних (SQL Server та MongoDB) з постійним сховищем
+// 1. Контейнери баз даних (SQL Server, MongoDB) та кешу (Redis) з WithDataVolume
 // ============================================================================
 
 // Пароль SQL Server як параметр-секрет AppHost
@@ -54,32 +54,47 @@ var mongo = builder.AddMongoDB("mongo")
 // База даних ActivitiesDb (Проєкт №3, Лаб. 04 — Clean Architecture + CQRS + MongoDB)
 var activitiesDb = mongo.AddDatabase("ActivitiesDb");
 
+// Контейнер Redis для централізованого розподіленого кешування L2 (Лаб. 06)
+var redis = builder.AddRedis("redis")
+    .WithDataVolume()
+    .WithLifetime(ContainerLifetime.Persistent);
+
 // ============================================================================
-// 2.2. Реєстрація наявних мікросервісів (БД -> Сервіси)
+// 2. Реєстрація мікросервісів із прив'язкою до своїх БД та спільного Redis
 // ============================================================================
 
 var salesApi = builder.AddProject<Projects.Sales_Api>("sales-api")
     .WithReference(salesDb)
-    .WaitFor(salesDb);
+    .WaitFor(salesDb)
+    .WithReference(redis)
+    .WaitFor(redis);
 
 var catalogApi = builder.AddProject<Projects.Catalog_Api>("catalog-api")
     .WithReference(catalogDb)
-    .WaitFor(catalogDb);
+    .WaitFor(catalogDb)
+    .WithReference(redis)
+    .WaitFor(redis);
 
 var activitiesApi = builder.AddProject<Projects.Activities_WebApi>("activities-api")
     .WithReference(activitiesDb)
-    .WaitFor(activitiesDb);
+    .WaitFor(activitiesDb)
+    .WithReference(redis)
+    .WaitFor(redis);
 
 // ============================================================================
-// 2.3. Реєстрація Aggregator та ApiGateway (БД -> Сервіси -> Aggregator -> Gateway)
+// 3. Реєстрація Aggregator (gRPC-клієнт + Redis) та ApiGateway (YARP)
 // ============================================================================
 
 var aggregator = builder.AddProject<Projects.Platform_Aggregator>("aggregator")
     .WithReference(salesApi)
     .WithReference(catalogApi)
     .WithReference(activitiesApi)
+    .WithReference(redis)
     .WithEnvironment("services__orders-api__http__0", salesApi.GetEndpoint("http"))
+    .WithEnvironment("services__orders-api__https__0", salesApi.GetEndpoint("https"))
     .WithEnvironment("services__reviews-api__http__0", activitiesApi.GetEndpoint("http"))
+    .WithEnvironment("services__reviews-api__https__0", activitiesApi.GetEndpoint("https"))
+    .WaitFor(redis)
     .WaitFor(salesApi)
     .WaitFor(catalogApi)
     .WaitFor(activitiesApi);

@@ -1,0 +1,49 @@
+syntax = "proto3";
+
+option csharp_namespace = "Orders.Grpc";
+package orders;
+
+service OrdersService {
+  rpc GetOrder (GetOrderRequest) returns (OrderReply);
+  rpc GetClient (GetClientRequest) returns (ClientReply);
+}
+
+message GetOrderRequest {
+  int64 id = 1;
+}
+
+message GetClientRequest {
+  int64 id = 1;
+}
+
+message OrderItemReply {
+  int64 product_id = 1;
+  string product_name = 2;
+  int32 quantity = 3;
+  double unit_price = 4;
+  double discount = 5;
+  double total_price = 6;
+}
+
+message ClientReply {
+  int64 id = 1;
+  string company_name = 2;
+  string contact_person = 3;
+  string email = 4;
+  string phone = 5;
+  string industry = 6;
+}
+
+message OrderReply {
+  int64 id = 1;
+  string deal_number = 2;
+  string title = 3;
+  string status = 4;
+  double total_amount = 5;
+  string created_at = 6;
+  int64 client_id = 7;
+  ClientReply client = 8;
+  string owner_name = 9;
+  string owner_role = 10;
+  repeated OrderItemReply items = 11;
+}

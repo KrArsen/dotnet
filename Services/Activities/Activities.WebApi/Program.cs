@@ -14,11 +14,21 @@ builder.AddServiceDefaults();
 builder.Services.AddExceptionHandler<GlobalExceptionHandler>();
 builder.Services.AddProblemDetails();
 
-// 3. Реєстрація шару Application (MediatR, Pipeline Behaviors, Caching, FluentValidation)
+// 3. Розподілений кеш Redis через Aspire + шар Application (MediatR, Pipeline Behaviors, L1+L2 Caching, FluentValidation)
+builder.AddRedisDistributedCache("redis");
+builder.Services.AddMemoryCache(o => o.SizeLimit = 10_000);
+builder.Services.AddSingleton<Activities.WebApi.Metrics.CacheMetrics>();
 builder.Services.AddApplication(builder.Configuration);
 
 // 4. Реєстрація шару Infrastructure (MongoDB Driver, Context, Repositories, Queries, Seeding)
 builder.Services.AddInfrastructure(builder.Configuration);
+
+// 4.1. gRPC-сервіс із серверним interceptor-ом логування
+builder.Services.AddScoped<Activities.WebApi.Grpc.ReviewsLoggingInterceptor>();
+builder.Services.AddGrpc(o =>
+{
+    o.Interceptors.Add<Microsoft.Extensions.Hosting.LoggingInterceptor>();
+});
 
 // 5. Реєстрація AutoMapper з WebApi та Application профілями
 builder.Services.AddAutoMapper(cfg =>
@@ -71,5 +81,6 @@ if (app.Environment.IsDevelopment() || true)
 app.MapGet("/", () => Results.Redirect("/swagger"));
 app.MapDefaultEndpoints();
 app.MapControllers();
+app.MapGrpcService<Activities.WebApi.Grpc.ReviewsGrpcService>();
 
 app.Run();

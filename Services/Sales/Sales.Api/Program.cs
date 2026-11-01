@@ -63,19 +63,35 @@ builder.Services.AddScoped(sp => sp.GetRequiredService<IUnitOfWork>().Deals);
 builder.Services.AddScoped(sp => sp.GetRequiredService<IUnitOfWork>().Products);
 builder.Services.AddScoped(sp => sp.GetRequiredService<IUnitOfWork>().TeamMembers);
 
-// Пам'ять та кешування ідемпотентності
-builder.Services.AddMemoryCache();
+// Дворівневе кешування: L1 (IMemoryCache з обмеженням SizeLimit) + L2 (IDistributedCache поверх Redis через Aspire)
+builder.AddRedisDistributedCache("redis");
+builder.Services.AddMemoryCache(o => o.SizeLimit = 10_000);
 builder.Services.AddSingleton<IIdempotencyStore, MemoryIdempotencyStore>();
+builder.Services.AddSingleton<SalesCacheMetrics>();
+builder.Services.AddSingleton<Sales.Api.Metrics.CacheMetrics>();
+builder.Services.AddScoped<SalesTwoLevelCacheService>();
 
 // Явна реєстрація валідаторів рівня 2 (Scoped)
 builder.Services.AddScoped<IClientValidator, ClientValidator>();
 builder.Services.AddScoped<IDealValidator, DealValidator>();
 
-// Явна реєстрація бізнес-сервісів BLL (Scoped)
+// Явна реєстрація бізнес-сервісів BLL (Scoped) з дворівневим кешем для IDealService
 builder.Services.AddScoped<IClientService, ClientService>();
-builder.Services.AddScoped<IDealService, DealService>();
+builder.Services.AddScoped<DealService>();
+builder.Services.AddScoped<IDealService>(sp =>
+    new CachedDealService(
+        sp.GetRequiredService<DealService>(),
+        sp.GetRequiredService<SalesTwoLevelCacheService>(),
+        sp.GetRequiredService<ILogger<CachedDealService>>()));
 builder.Services.AddScoped<IProductService, ProductService>();
 builder.Services.AddScoped<ITeamMemberService, TeamMemberService>();
+
+// gRPC-сервіс із серверним interceptor-ом логування
+builder.Services.AddScoped<Sales.Api.Grpc.OrdersLoggingInterceptor>();
+builder.Services.AddGrpc(o =>
+{
+    o.Interceptors.Add<Microsoft.Extensions.Hosting.LoggingInterceptor>();
+});
 
 // Реєстрація AutoMapper з ліцензійним ключем з конфігурації
 builder.Services.AddAutoMapper(cfg =>
@@ -115,6 +131,7 @@ app.MapGet("/", () => Results.Redirect("/swagger"));
 app.MapDefaultEndpoints();
 
 app.MapControllers();
+app.MapGrpcService<Sales.Api.Grpc.OrdersGrpcService>();
 
 app.Run();
 

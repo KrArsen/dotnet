@@ -1,23 +1,24 @@
+using Activities.Application.Caching;
 using Activities.Application.Common.Caching;
 using Activities.Application.Common.Interfaces;
 using MediatR;
-using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Logging;
 
 namespace Activities.Application.Common.Behaviors;
 
 /// <summary>
-/// Pipeline Behavior кешування запитів читання ICacheableQuery з інвалідацією після виконання команд
+/// Pipeline Behavior дворівневого кешування запитів читання ICacheableQuery (L1 пам'ять -> L2 Redis -> MongoDB)
+/// із синхронною інвалідацією після виконання команд.
 /// </summary>
 public class CachingBehavior<TRequest, TResponse> : IPipelineBehavior<TRequest, TResponse>
     where TRequest : notnull
 {
-    private readonly IMemoryCache _cache;
+    private readonly ReviewsTwoLevelCacheService _cache;
     private readonly ICacheVersionProvider _versionProvider;
     private readonly ILogger<CachingBehavior<TRequest, TResponse>> _logger;
 
     public CachingBehavior(
-        IMemoryCache cache,
+        ReviewsTwoLevelCacheService cache,
         ICacheVersionProvider versionProvider,
         ILogger<CachingBehavior<TRequest, TResponse>> logger)
     {
@@ -31,33 +32,34 @@ public class CachingBehavior<TRequest, TResponse> : IPipelineBehavior<TRequest, 
         RequestHandlerDelegate<TResponse> next,
         CancellationToken cancellationToken)
     {
-        // 1. Якщо це команда — виконуємо її і при успіху інвалідуємо кеш запитів
+        // 1. Якщо це команда — виконуємо її і синхронно інвалідуємо кеш запитів
         if (request is ICommand || request is ICommand<TResponse>)
         {
             var commandResult = await next();
+            var reason = typeof(TRequest).Name;
             _versionProvider.Invalidate();
-            _logger.LogDebug("Cache invalidated due to execution of mutation command {RequestName}", typeof(TRequest).Name);
+            await _cache.RemoveAsync($"reviews:v{_versionProvider.CurrentVersion - 1}", reason, cancellationToken);
+            _logger.LogInformation("Cache invalidated synchronously after command {Reason}", reason);
             return commandResult;
         }
 
-        // 2. Якщо це кешований запит — перевіряємо наявність у пам'яті
+        // 2. Якщо це кешований запит — перевіряємо L1 (IMemoryCache) -> L2 (Redis) -> MongoDB
         if (request is ICacheableQuery cacheable)
         {
             var versionedKey = $"{cacheable.CacheKey}:v{_versionProvider.CurrentVersion}";
+            var l1Ttl = cacheable.Expiration ?? TimeSpan.FromSeconds(30);
+            var l2Ttl = TimeSpan.FromTicks(l1Ttl.Ticks * 5); // L1 TTL строго коротший за L2 TTL
 
-            if (_cache.TryGetValue(versionedKey, out TResponse? cachedResponse) && cachedResponse != null)
-            {
-                _logger.LogDebug("Cache HIT for key: {CacheKey}", versionedKey);
-                return cachedResponse;
-            }
+            var result = await _cache.GetOrSetAsync(
+                versionedKey,
+                () => next(),
+                l1Ttl: l1Ttl,
+                l2Ttl: l2Ttl,
+                l1Sliding: TimeSpan.FromSeconds(15),
+                size: 1,
+                ct: cancellationToken);
 
-            _logger.LogDebug("Cache MISS for key: {CacheKey}", versionedKey);
-            var freshResponse = await next();
-
-            var expiration = cacheable.Expiration ?? TimeSpan.FromSeconds(30);
-            _cache.Set(versionedKey, freshResponse, expiration);
-
-            return freshResponse;
+            return result!;
         }
 
         return await next();

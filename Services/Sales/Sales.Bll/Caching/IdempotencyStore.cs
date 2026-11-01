@@ -44,7 +44,11 @@ public class MemoryIdempotencyStore : IIdempotencyStore
         }
 
         var fullKey = $"idempotency:{key}";
-        _cache.Set(fullKey, new IdempotentResponse(statusCode, body), ttl ?? DefaultTtl);
+        _cache.Set(fullKey, new IdempotentResponse(statusCode, body), new MemoryCacheEntryOptions
+        {
+            Size = 1,
+            AbsoluteExpirationRelativeToNow = ttl ?? DefaultTtl
+        });
         return Task.CompletedTask;
     }
 }

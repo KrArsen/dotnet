@@ -1,3 +1,5 @@
+using Catalog.Api.Grpc;
+using Catalog.Api.Metrics;
 using Catalog.Api.Middleware;
 using Catalog.Bll.Caching;
 using Catalog.Bll.Mapping;
@@ -8,7 +10,6 @@ using Catalog.Dal.Seeding;
 using Catalog.Dal.UnitOfWork;
 using FluentValidation;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Caching.Memory;
 using Microsoft.OpenApi.Models;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -32,8 +33,12 @@ builder.Services.AddDbContext<AppDbContext>(options =>
 // 4. Реєстрація Unit of Work та репозиторіїв
 builder.Services.AddScoped<IUnitOfWork, UnitOfWork>();
 
-// 5. In-Memory кешування
-builder.Services.AddMemoryCache();
+// 5. Дворівневе кешування: L1 (IMemoryCache з обмеженням SizeLimit) + L2 (IDistributedCache поверх Redis через Aspire)
+builder.AddRedisDistributedCache("redis");
+builder.Services.AddMemoryCache(o => o.SizeLimit = 10_000);
+builder.Services.AddSingleton<CatalogCacheMetrics>();
+builder.Services.AddSingleton<Catalog.Api.Metrics.CacheMetrics>();
+builder.Services.AddScoped<ITwoLevelCacheService, TwoLevelCacheService>();
 
 // 6. Реєстрація AutoMapper з підтримкою конфігурації ліцензійного ключа
 builder.Services.AddAutoMapper(cfg =>
@@ -48,16 +53,27 @@ builder.Services.AddAutoMapper(cfg =>
 // 7. Реєстрація FluentValidation валідаторів через AddValidatorsFromAssembly
 builder.Services.AddValidatorsFromAssembly(typeof(Catalog.Bll.Validation.CreateProductDtoValidator).Assembly);
 
-// 8. Реєстрація BLL-сервісів (з IMemoryCache декоратором для ProductService)
+// 8. Реєстрація BLL-сервісів (з дворівневим кешем L1+L2 для ProductService та CategoryService)
 builder.Services.AddScoped<ProductService>();
 builder.Services.AddScoped<IProductService>(sp =>
+    new CachedProductService(
+        sp.GetRequiredService<ProductService>(),
+        sp.GetRequiredService<ITwoLevelCacheService>(),
+        sp.GetRequiredService<ILogger<CachedProductService>>()));
+
+builder.Services.AddScoped<CategoryService>();
+builder.Services.AddScoped<ICategoryService>(sp =>
+    new CachedCategoryService(
+        sp.GetRequiredService<CategoryService>(),
+        sp.GetRequiredService<ITwoLevelCacheService>(),
+        sp.GetRequiredService<ILogger<CachedCategoryService>>()));
+
+// 9. gRPC-сервіс із серверним interceptor-ом логування
+builder.Services.AddScoped<CatalogLoggingInterceptor>();
+builder.Services.AddGrpc(o =>
 {
-    var concrete = sp.GetRequiredService<ProductService>();
-    var cache = sp.GetRequiredService<IMemoryCache>();
-    var logger = sp.GetRequiredService<ILogger<CachedProductService>>();
-    return new CachedProductService(concrete, cache, logger);
+    o.Interceptors.Add<Microsoft.Extensions.Hosting.LoggingInterceptor>();
 });
-builder.Services.AddScoped<ICategoryService, CategoryService>();
 
 // 9. Контролери та Swagger/OpenAPI
 builder.Services.AddControllers();
@@ -99,6 +115,7 @@ if (app.Environment.IsDevelopment() || true) // Дозволяємо Swagger д�
 app.MapGet("/", () => Results.Redirect("/swagger"));
 app.MapDefaultEndpoints();
 app.MapControllers();
+app.MapGrpcService<CatalogGrpcService>();
 
 // 11. Автоматичне застосування міграцій та програмний сідінг у scope
 using (var scope = app.Services.CreateScope())
