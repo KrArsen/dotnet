@@ -1,0 +1,57 @@
+@gatewayUrl = http://localhost:5000
+@correlationId = 77777777-8888-4999-aaaa-bbbbbbbbbbbb
+
+### 1. Перевірка статусу API Gateway (Health & Info)
+GET {{gatewayUrl}}/
+X-Correlation-Id: {{correlationId}}
+
+### 2. Health Check шлюзу
+GET {{gatewayUrl}}/health
+
+### 3. Aliveness Check шлюзу
+GET {{gatewayUrl}}/alive
+
+### 4. Маршрутизація через YARP до мікросервісу Sales / Orders (Лаб. 02 — угода #1)
+GET {{gatewayUrl}}/api/orders/1
+Accept: application/json
+X-Correlation-Id: {{correlationId}}
+
+### 5. Маршрутизація через YARP до мікросервісу Sales (Лаб. 02 — список клієнтів)
+GET {{gatewayUrl}}/api/clients?page=1&pageSize=10
+Accept: application/json
+X-Correlation-Id: {{correlationId}}
+
+### 6. Маршрутизація через YARP до мікросервісу Catalog (Лаб. 03 — список товарів/послуг)
+GET {{gatewayUrl}}/api/products?page=1&pageSize=10
+Accept: application/json
+X-Correlation-Id: {{correlationId}}
+
+### 7. Маршрутизація через YARP до мікросервісу Catalog (Лаб. 03 — товар #1)
+GET {{gatewayUrl}}/api/products/1
+Accept: application/json
+X-Correlation-Id: {{correlationId}}
+
+### 8. Маршрутизація через YARP до мікросервісу Activities / Reviews (Лаб. 04 — відгуки з MongoDB)
+GET {{gatewayUrl}}/api/reviews?page=1&pageSize=10
+Accept: application/json
+X-Correlation-Id: {{correlationId}}
+
+### 9. Маршрутизація через YARP до мікросервісу Activities (Лаб. 04 — активності клієнта #1)
+GET {{gatewayUrl}}/api/activities?clientId=1&page=1&pageSize=10
+Accept: application/json
+X-Correlation-Id: {{correlationId}}
+
+### 10. Aggregator Service: повна агрегована картка замовлення/угоди #1 (Task.WhenAll: Orders + Catalog + Reviews/Activities)
+GET {{gatewayUrl}}/api/aggregator/orders/1/full
+Accept: application/json
+X-Correlation-Id: {{correlationId}}
+
+### 11. Aggregator Service: повна агрегована картка за доменним маршрутом /deals/1/full
+GET {{gatewayUrl}}/api/aggregator/deals/1/full
+Accept: application/json
+X-Correlation-Id: {{correlationId}}
+
+### 12. Aggregator Service: перевірка 404 ProblemDetails для неіснуючого замовлення
+GET {{gatewayUrl}}/api/aggregator/orders/999999/full
+Accept: application/json
+X-Correlation-Id: {{correlationId}}

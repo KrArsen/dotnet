@@ -1138,3 +1138,251 @@ dotnet run --project Services/Activities/Activities.WebApi
 
 
 
+---
+
+# Практична робота №05: Побудова мікросервісної платформи з .NET Aspire, OpenTelemetry, Serilog, YARP та Aggregator
+
+## 1. Загальний огляд мікросервісної платформи
+
+У межах практичної роботи №05 наявні мікросервіси з попередніх робіт (**Sales / Orders** — Лаб. 02, **Catalog** — Лаб. 03, **Activities / Reviews** — Лаб. 04) об'єднано в єдину розподілену платформу на базі **.NET Aspire**, доповнену централізованими налаштуваннями спостережуваності (**ServiceDefaults**), єдиною точкою входу (**API Gateway на YARP**) та сервісом композиції даних (**Aggregator Service**).
+
+```mermaid
+flowchart LR
+    Client["Клієнт (HTTP / cURL / Browser)"] -->|"http://localhost:5000\nX-Correlation-Id"| Gateway["Platform.ApiGateway\n(YARP + Service Discovery)"]
+    
+    Gateway -->|"/api/deals/*, /api/orders/*,\n/api/clients/*"| Sales["sales-api\n(Sales.Api - ADO.NET + Dapper)"]
+    Gateway -->|"/api/products/*,\n/api/categories/*"| Catalog["catalog-api\n(Catalog.Api - EF Core)"]
+    Gateway -->|"/api/activities/*,\n/api/reviews/*"| Activities["activities-api\n(Activities.WebApi - Clean Arch + CQRS)"]
+    Gateway -->|"/api/aggregator/*"| Aggregator["aggregator\n(Platform.Aggregator)"]
+
+    Aggregator -->|"Task.WhenAll (Typed HttpClients)\n+ CorrelationIdHandler"| Sales
+    Aggregator -->|"Task.WhenAll (SafeAsync)"| Catalog
+    Aggregator -->|"Task.WhenAll (SafeAsync)"| Activities
+
+    Sales --> SalesDb[("SQL Server: SalesDb\n(WithDataVolume)")]
+    Catalog --> CatalogDb[("SQL Server: CatalogDb\n(WithDataVolume)")]
+    Activities --> Mongo[("MongoDB: ActivitiesDb\n(WithDataVolume)")]
+```
+
+### Компоненти платформи:
+| Компонент | Призначення та роль у платформі |
+| :--- | :--- |
+| **`Platform.AppHost`** | Оркестратор `.NET Aspire`, який запускає контейнери баз даних (`sqlserver` та `mongo` із `WithDataVolume()`), ініціалізує бази `SalesDb`, `CatalogDb`, `ActivitiesDb`, керує порядком старту (`БД -> мікросервіси -> Aggregator -> Gateway`) через `WithReference()` та `WaitFor()`, і призначає Gateway фіксований порт `5000`. |
+| **`Platform.ServiceDefaults`** | Спільна бібліотека наскрізних налаштувань (`AddServiceDefaults`, `MapDefaultEndpoints`): структуроване логування **Serilog** (`CompactJsonFormatter`, `writeToProviders: true`, enrichers `ServiceName`, `Environment`, `MachineName`, `ThreadId`, `FromLogContext`), наскрізний **`CorrelationIdMiddleware`** та **`CorrelationIdHandler`**, розподілене трасування **OpenTelemetry** (`ASP.NET Core`, `HttpClient`, `SqlClient`, `MongoDB DiagnosticSources`, власні `ActivitySource` та `UseOtlpExporter`), `ServiceDiscovery` і `StandardResilienceHandler`. |
+| **`Platform.ApiGateway`** | Єдина вхідна точка системи на базі **YARP Reverse Proxy** (`порт 5000`). Генерує або зберігає `X-Correlation-Id` до передачі запиту в YARP, маршрутизує запити за логічними іменами сервісів через `AddServiceDiscoveryDestinationResolver()`, логує кожне рішення маршрутизації (`Method`, `Path`, `Route`, `Cluster`, `StatusCode`, `Elapsed ms`). |
+| **`Platform.Aggregator`** | Реалізує **Gateway Aggregation Pattern**: за допомогою строго типізованих клієнтів (`OrdersClient`/`SalesClient`, `CatalogClient`, `ReviewsClient`/`ActivitiesClient`) одночасно (`Task.WhenAll`) опитує мікросервіси та повертає консолідовану картку угоди/замовлення `FullOrderDto`. При зупинці одного з сервісів повертає часткову відповідь (HTTP 200) зі списком попереджень у `Warnings`. |
+| **Мікросервіси (`Sales.Api`, `Catalog.Api`, `Activities.WebApi`)** | Незалежні бізнес-сервіси з власними БД. Інтегровані з мінімальними змінами (`builder.AddServiceDefaults()`, `app.MapDefaultEndpoints()`), доповнені структурованим логуванням бізнес-подій та власними spans через `ActivitySource`. |
+
+---
+
+## 2. Структура рішення Лаб. 05
+
+```text
+<корінь репозиторія>/
+├── README.md                                 ★ Документація платформи та інструкція запуску
+├── docs/                                     # ERD-діаграми, опис контекстів, приклади документів
+├── db/                                       # SQL- і MongoDB-скрипти (p1, p2, p3)
+├── Platform.slnx                             ★ Єдине рішення всієї платформи
+├── Platform.AppHost/                         ★ Оркестратор .NET Aspire (AppHost.cs)
+├── Platform.ServiceDefaults/                 ★ Спільні налаштування: Serilog, OpenTelemetry, CorrelationId, HealthChecks
+│   ├── Extensions.cs
+│   ├── CorrelationIdMiddleware.cs
+│   └── CorrelationIdHandler.cs
+├── Platform.ApiGateway/                      ★ Вхідний шлюз YARP Reverse Proxy (порт 5000)
+│   ├── Program.cs
+│   ├── appsettings.json
+│   └── Dockerfile
+├── Platform.Aggregator/                      ★ Сервіс агрегації даних (Aggregator Pattern)
+│   ├── Clients/                              # OrdersClient, SalesClient, CatalogClient, ReviewsClient, ActivitiesClient
+│   ├── Controllers/                          # AggregatorController (/api/aggregator/orders/{id}/full, /api/aggregator/deals/{id}/full)
+│   ├── Models/                               # FullOrderDto та вкладені моделі
+│   ├── Services/                             # OrderAggregationService (Task.WhenAll + SafeAsync)
+│   └── Program.cs
+└── Services/
+    ├── Sales/                                # Проєкт №1 — ADO.NET + Dapper (SalesDb)
+    ├── Catalog/                              # Проєкт №2 — EF Core Code-First (CatalogDb)
+    └── Activities/                           # Проєкт №3 — Clean Architecture + CQRS + MongoDB (ActivitiesDb)
+```
+
+---
+
+## 3. Інструкція запуску платформи
+
+### 3.1. Передумови
+1. Встановлений **.NET 10 SDK**.
+2. Запущений **Docker Desktop** (необхідний для контейнерів `SQL Server 2022` та `MongoDB`).
+
+### 3.2. Запуск усієї платформи однією командою через AppHost
+Запустіть оркестратор `.NET Aspire` з кореня репозиторію:
+
+```bash
+# За потреби встановіть секрет пароля SQL Server у User Secrets AppHost:
+dotnet user-secrets set "Parameters:sql-password" "Your_Strong_Password_123!" --project Platform.AppHost
+
+# Запуск усієї платформи:
+dotnet run --project Platform.AppHost
+```
+
+Після запуску:
+- **Aspire Dashboard** відкриється автоматично (посилання з токеном виводиться в консоль), де у статусі `Running` відобразяться ресурси: `sqlserver`, `SalesDb`, `CatalogDb`, `mongo`, `ActivitiesDb`, `sales-api`, `catalog-api`, `activities-api`, `aggregator`, `gateway`.
+- **API Gateway (єдина точка входу):** `http://localhost:5000`
+- **Health Check шлюзу:** `http://localhost:5000/health` та `http://localhost:5000/alive`
+
+---
+
+## 4. Приклади запитів через API Gateway та до Aggregator
+
+Усі запити клієнта виконуються через **API Gateway** на фіксованому порту **`http://localhost:5000`**.
+
+### 4.1. Маршрутизація через Gateway до мікросервісів
+
+```bash
+# 1. Мікросервіс Sales / Orders (Лаб. 02 — угоди/замовлення та клієнти):
+curl -i http://localhost:5000/api/orders/1
+curl -i http://localhost:5000/api/deals/1
+curl -i http://localhost:5000/api/clients?page=1&pageSize=10
+
+# 2. Мікросервіс Catalog (Лаб. 03 — послуги та цифрові товари):
+curl -i "http://localhost:5000/api/products?page=1&pageSize=10"
+curl -i http://localhost:5000/api/products/1
+curl -i http://localhost:5000/api/categories
+
+# 3. Мікросервіс Activities / Reviews (Лаб. 04 — активності та відгуки клієнтів у MongoDB):
+curl -i "http://localhost:5000/api/reviews?page=1&pageSize=10"
+curl -i "http://localhost:5000/api/activities?clientId=1&page=1&pageSize=10"
+```
+
+У кожній відповіді присутній наскрізний заголовок `X-Correlation-Id` (згенерований у Gateway або переданий клієнтом):
+```bash
+curl -i http://localhost:5000/api/orders/1 -H "X-Correlation-Id: 11111111-2222-3333-4444-555555555555"
+```
+
+### 4.2. Запити до Aggregator Service через Gateway
+
+**Повна агрегована картка замовлення/угоди (`Order/Deal` + `Catalog Products` + `Reviews & Activities`):**
+```bash
+curl -i http://localhost:5000/api/aggregator/orders/1/full
+# або за доменним синонімом:
+curl -i http://localhost:5000/api/aggregator/deals/1/full
+```
+
+**Приклад повної відповіді Aggregator (коли всі сервіси працюють):**
+```json
+{
+  "order": {
+    "id": 1,
+    "dealNumber": "DL-2025-0001",
+    "title": "Корпоративний портал АгроТрейд + SEO супровід",
+    "clientId": 1,
+    "ownerId": 2,
+    "stage": "Won",
+    "totalAmount": 115000.00,
+    "createdAt": "2025-01-12T09:15:00Z",
+    "items": [
+      {
+        "dealId": 1,
+        "productId": 1,
+        "productName": "Розробка корпоративного веб-сайту під ключ",
+        "unitPrice": 85000.00,
+        "discount": 0.00,
+        "quantity": 1,
+        "totalPrice": 85000.00
+      }
+    ]
+  },
+  "products": [
+    {
+      "id": 1,
+      "sku": "WEB-CORP-001",
+      "name": "Розробка корпоративного веб-сайту під ключ",
+      "itemType": "Service",
+      "price": 85000.00,
+      "stockQuantity": 15,
+      "isActive": true
+    }
+  ],
+  "reviews": [
+    {
+      "id": "653000000000000000000001",
+      "productId": 1,
+      "productName": "ТОВ «АгроТрейд Захід»",
+      "authorName": "Вікторія Коваль",
+      "rating": 5,
+      "text": "Вхідний дзвінок від комерційного директора щодо розробки корпоративного порталу.",
+      "commentsCount": 2,
+      "version": 1,
+      "createdAt": "2026-10-27T00:00:00Z"
+    }
+  ],
+  "enrichedItems": [
+    {
+      "productId": 1,
+      "productName": "Розробка корпоративного веб-сайту під ключ",
+      "sku": "WEB-CORP-001",
+      "itemType": "Service",
+      "quantity": 1,
+      "dealUnitPrice": 85000.00,
+      "currentCatalogPrice": 85000.00,
+      "discount": 0.00,
+      "lineTotal": 85000.00,
+      "availableStock": 15,
+      "isActiveInCatalog": true,
+      "averageProductRating": 5.0,
+      "reviewsCount": 1
+    }
+  ],
+  "summary": {
+    "totalDistinctProducts": 1,
+    "catalogProductsMatched": 1,
+    "totalReviewsCount": 1,
+    "averageRating": 5.0,
+    "totalClientActivitiesCount": 3,
+    "isPartialResponse": false
+  },
+  "warnings": []
+}
+```
+
+**Приклад часткової відповіді (Graceful Degradation при зупиненому `activities-api` / `reviews-api`):**
+При зупинці `activities-api` у Aspire Dashboard запит `GET http://localhost:5000/api/aggregator/orders/1/full` повертає **HTTP 200 OK** із даними замовлення та каталогу і попередженнями у масиві `warnings`:
+```json
+{
+  "order": { "...": "..." },
+  "products": [ { "...": "..." } ],
+  "reviews": [],
+  "enrichedItems": [ { "...": "..." } ],
+  "summary": {
+    "totalDistinctProducts": 1,
+    "catalogProductsMatched": 1,
+    "totalReviewsCount": 0,
+    "totalClientActivitiesCount": 0,
+    "isPartialResponse": true
+  },
+  "warnings": [
+    "reviews-api is unavailable",
+    "activities-api is unavailable"
+  ]
+}
+```
+
+---
+
+## 5. Звіт відповідності критеріям автоперевірки Лаб. 05 (15 критеріїв — 12 балів)
+
+| № | Критерій (Бали) | Тип | Де шукає перевірка | Фактична реалізація у репозиторії | Вердикт |
+| :---: | :--- | :---: | :--- | :--- | :---: |
+| 1 | **AppHost, ServiceDefaults, Gateway, Aggregator і три сервіси з правильними посиланнями** (0.8 б.) | AST | `Platform.slnx` і `*.csproj` | `Platform.AppHost` посилається на `Sales.Api`, `Catalog.Api`, `Activities.WebApi`, `Platform.ApiGateway`, `Platform.Aggregator`; сервіси, Gateway та Aggregator посилаються лише на `Platform.ServiceDefaults`; ніхто не посилається на `AppHost`. | ✅ Виконано |
+| 2 | **Контейнери SQL Server і MongoDB з постійним сховищем** (0.9 б.) | ШІ | `Platform.AppHost/` | У `AppHost.cs` пароль SQL Server оголошено як `AddParameter("sql-password", secret: true)`; для обох контейнерів (`sqlserver` і `mongo`) викликано `.WithDataVolume()`; бази `SalesDb`, `CatalogDb`, `ActivitiesDb` збігаються з рядками підключення сервісів. | ✅ Виконано |
+| 3 | **Сервіси, Aggregator і Gateway зареєстровані з WithReference і WaitFor** (0.9 б.) | ШІ | `Platform.AppHost/` | Забезпечено суворий порядок запуску: `БД -> сервіси -> Aggregator -> Gateway` через `.WithReference()` та `.WaitFor()`. Gateway має фіксований порт `5000` (`WithHttpEndpoint(port: 5000, name: "public")`). | ✅ Виконано |
+| 4 | **Мікросервіси інтегровані з мінімальними змінами** (0.8 б.) | ШІ | `Program.cs сервісів`, `appsettings*.json` | У `Program.cs` усіх трьох сервісів додано `builder.AddServiceDefaults()` та `app.MapDefaultEndpoints()`; рядки підключення читаються з конфігурації (`GetConnectionString`), усі маршрути мають префікс `/api/{domain}`. | ✅ Виконано |
+| 5 | **Логування бізнес-подій і власні spans** (0.6 б.) | ШІ | `<Сервіс>.Bll/`, `<Сервіс3>.Application/`, `<Сервіс>.Api/` | У `DealService`, `ProductService`, `CreateActivityCommandHandler`, `UpdateActivityCommandHandler`, `CreateReviewCommandHandler` додано `ActivitySource` spans з тегами та структуроване логування бізнес-подій (`OrderId`, `ProductId`, `ActivityId`, `Amount`, `Status`). | ✅ Виконано |
+| 6 | **Serilog у ServiceDefaults зі збагаченням і передачею в OpenTelemetry** (1.0 б.) | ШІ | `Platform.ServiceDefaults/` | У `Extensions.cs` налаштовано `AddSerilog` із `FromLogContext`, `ServiceName`, `WithEnvironmentName`, `WithMachineName`, `WithThreadId`, рівнями `Debug`/`Information` за середовищем, `CompactJsonFormatter` та `writeToProviders: true`. | ✅ Виконано |
+| 7 | **Наскрізний CorrelationId: middleware і DelegatingHandler** (1.1 б.) | ШІ | `Platform.ServiceDefaults/`, `Platform.ApiGateway/` | `CorrelationIdMiddleware.cs` зчитує або генерує `X-Correlation-Id`, записує у `Request.Headers`, `Response.Headers` та `LogContext.PushProperty`; `CorrelationIdHandler.cs` передає заголовок у всі вихідні `HttpClient`. | ✅ Виконано |
+| 8 | **OpenTelemetry: трасування HTTP, SQL і MongoDB з експортом OTLP** (1.0 б.) | ШІ | `Platform.ServiceDefaults/` | У `ConfigureOpenTelemetry` підключено `AddAspNetCoreInstrumentation`, `AddHttpClientInstrumentation`, `AddSqlClientInstrumentation`, `AddSource("MongoDB.Driver.Core.Extensions.DiagnosticSources")`, власні `ActivitySource` та `UseOtlpExporter()`. У `MongoDbContext` підключено `DiagnosticsActivityEventSubscriber`. | ✅ Виконано |
+| 9 | **Маршрути й кластери YARP з логічними іменами сервісів** (1.1 б.) | ШІ | `Platform.ApiGateway/` | У `appsettings.json` налаштовано catch-all маршрути (`/api/orders/{**catch-all}`, `/api/deals/{**catch-all}`, `/api/products/{**catch-all}`, `/api/reviews/{**catch-all}`, `/api/activities/{**catch-all}`) та маршрут `aggregator` з `Order: 1`; адреси кластерів `http://<ім'я-ресурсу>` резолвляться через `AddServiceDiscoveryDestinationResolver()`. | ✅ Виконано |
+| 10 | **CorrelationId і логування маршрутизації в Gateway** (0.6 б.) | ШІ | `Platform.ApiGateway/` | У `Platform.ApiGateway/Program.cs` `app.UseMiddleware<CorrelationIdMiddleware>()` зареєстровано перед `app.MapReverseProxy()`; middleware логує `Method`, `Path`, `Route`, `Cluster`, `StatusCode` та `Elapsed` мс. | ✅ Виконано |
+| 11 | **Typed HttpClients для кожного сервісу через service discovery** (0.8 б.) | ШІ | `Platform.Aggregator/` | Створено окремі класи `OrdersClient`, `SalesClient`, `CatalogClient`, `ReviewsClient`, `ActivitiesClient`; зареєстровані через `AddHttpClient` із адресами `https+http://orders-api`, `https+http://catalog-api`, `https+http://reviews-api` та десеріалізацією в DTO. | ✅ Виконано |
+| 12 | **Агрегувальний ендпоінт із паралельними викликами Task.WhenAll** (0.9 б.) | ШІ | `Platform.Aggregator/` | Ендпоінт `GET /api/aggregator/orders/{id}/full` (та `/api/aggregator/deals/{id}/full`) виконує паралельні виклики через `Task.WhenAll`, прокидає `CancellationToken` у всі методи і не використовує `.Result` чи `Task.WaitAll`. | ✅ Виконано |
+| 13 | **Часткові відмови: доступні дані + перелік попереджень** (0.8 б.) | ШІ | `Platform.Aggregator/` | Метод `SafeAsync` вимірює тривалість кожного виклику через `Stopwatch`, логує час відповіді, перехоплює помилки мережі/таймаутів і додає повідомлення у список `Warnings` замість падіння з кодом 500. | ✅ Виконано |
+| 14 | **Композитний DTO під бізнес-сценарій** (0.5 б.) | ШІ | `Platform.Aggregator/` | `FullOrderDto` поєднує `Order`, `Products`, `Reviews`, `Activities`, `EnrichedItems`, `Summary` та `Warnings`; налаштовано `CamelCase` та `JsonIgnoreCondition.WhenWritingNull`, перевіряється приналежність товарів до замовлення. | ✅ Виконано |
+| 15 | **README з інструкцією запуску платформи** (0.2 б.) | ШІ | `README.md у корені репозиторію` | Додано повний опис архітектури Лаб. 05, інструкцію запуску `Platform.AppHost`, адресу Gateway (`http://localhost:5000`) та приклади запитів через Gateway і до Aggregator. | ✅ Виконано |

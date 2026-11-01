@@ -8,6 +8,7 @@ namespace Sales.Api.Controllers;
 
 [ApiController]
 [Route("api/[controller]")]
+[Route("api/orders")]
 [Produces("application/json")]
 public class DealsController : ControllerBase
 {

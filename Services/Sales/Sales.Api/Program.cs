@@ -1,6 +1,5 @@
 using Microsoft.Extensions.Options;
 using Microsoft.OpenApi.Models;
-using Sales.Api.Middleware;
 using Sales.Bll.Caching;
 using Sales.Bll.Mapping;
 using Sales.Bll.Services;
@@ -8,18 +7,12 @@ using Sales.Bll.Validation;
 using Sales.Dal.Interfaces;
 using Sales.Dal.Options;
 using Sales.Dal.UnitOfWork;
-using Serilog;
+using Sales.Api.Middleware;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Налаштування Serilog структурованого логування
-builder.Host.UseSerilog((context, services, configuration) =>
-{
-    configuration
-        .ReadFrom.Configuration(context.Configuration)
-        .ReadFrom.Services(services)
-        .Enrich.FromLogContext();
-});
+// 1. Централізовані налаштування платформи .NET Aspire (Serilog, OpenTelemetry, HealthChecks, ServiceDiscovery)
+builder.AddServiceDefaults();
 
 // Додавання стандартної підтримки ProblemDetails та централізованого обробника винятків
 builder.Services.AddExceptionHandler<DomainExceptionHandler>();
@@ -36,7 +29,7 @@ builder.Services.AddSwaggerGen(c =>
     {
         Title = "Sales Microservice API (CRM Small Business)",
         Version = "v1",
-        Description = "Лабораторна робота №02: Тришарова вертикаль DAL (ADO.NET + Dapper) -> BLL -> API з Unit of Work, ProblemDetails та Aspire."
+        Description = "Лабораторна робота №02 / №05: Тришарова вертикаль DAL (ADO.NET + Dapper) -> BLL -> API з Unit of Work, ProblemDetails та Aspire."
     });
 
     c.AddSecurityDefinition("CorrelationId", new OpenApiSecurityScheme
@@ -48,8 +41,9 @@ builder.Services.AddSwaggerGen(c =>
     });
 });
 
-// Отримання рядка підключення до SalesDb з перевіркою існування
+// Отримання рядка підключення до SalesDb з конфігурації (передається від Aspire або appsettings.json)
 var connectionString = builder.Configuration.GetConnectionString("SalesDb")
+    ?? builder.Configuration.GetConnectionString("OrdersDb")
     ?? throw new InvalidOperationException("Connection string 'SalesDb' not found in configuration.");
 
 // Налаштування параметрів DAL
@@ -100,8 +94,8 @@ builder.Services.AddAutoMapper(cfg =>
 
 var app = builder.Build();
 
-// Кореляційний Middleware (X-Correlation-Id) для наскрізного трасування
-app.UseMiddleware<CorrelationIdMiddleware>();
+// Кореляційний Middleware (X-Correlation-Id) для наскрізного трасування з ServiceDefaults
+app.UseMiddleware<Microsoft.Extensions.Hosting.CorrelationIdMiddleware>();
 
 // Обробка доменних та неперехоплених помилок через ProblemDetails (400, 404, 409, 500)
 app.UseExceptionHandler();
@@ -116,6 +110,9 @@ app.UseSwaggerUI(c =>
 
 // Перенаправлення з кореня на Swagger UI для зручності тестування
 app.MapGet("/", () => Results.Redirect("/swagger"));
+
+// Спільні ендпоінти платформи (/health та /alive)
+app.MapDefaultEndpoints();
 
 app.MapControllers();
 

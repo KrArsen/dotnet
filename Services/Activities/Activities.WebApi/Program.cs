@@ -4,19 +4,11 @@ using Activities.Infrastructure;
 using Activities.WebApi.Middleware;
 using Activities.WebApi.Mapping;
 using Microsoft.OpenApi.Models;
-using Serilog;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// 1. Налаштування структурованого логування Serilog
-builder.Host.UseSerilog((context, services, configuration) =>
-{
-    configuration
-        .ReadFrom.Configuration(context.Configuration)
-        .ReadFrom.Services(services)
-        .Enrich.FromLogContext()
-        .WriteTo.Console(outputTemplate: "[{Timestamp:HH:mm:ss} {Level:u3}] ({CorrelationId}) {Message:lj}{NewLine}{Exception}");
-});
+// 1. Централізовані налаштування платформи .NET Aspire (Serilog, OpenTelemetry, HealthChecks, ServiceDiscovery)
+builder.AddServiceDefaults();
 
 // 2. Глобальна обробка винятків RFC 7807/9457 ProblemDetails
 builder.Services.AddExceptionHandler<GlobalExceptionHandler>();
@@ -49,11 +41,11 @@ builder.Services.AddSwaggerGen(options =>
     {
         Title = "Activities & Reviews Web API (MongoDB + Clean Architecture + CQRS)",
         Version = "v1",
-        Description = "Мікросервіс комунікацій, активностей та відгуків клієнтів (Проєкт №3) предметної області CRM для малого бізнесу"
+        Description = "Лабораторна робота №04 / №05: Мікросервіс комунікацій, активностей та відгуків клієнтів (Проєкт №3) предметної області CRM для малого бізнесу"
     });
 });
 
-// 7. Health Check для MongoDB
+// 7. Health Check для MongoDB (інтегрується з MapDefaultEndpoints /health)
 builder.Services.AddHealthChecks()
     .AddMongoDb(
         sp => sp.GetRequiredService<Activities.Infrastructure.Persistence.MongoDbContext>().Database.Client,
@@ -63,11 +55,10 @@ builder.Services.AddHealthChecks()
 var app = builder.Build();
 
 // Побудова конвеєра обробки HTTP-запитів
-app.UseMiddleware<CorrelationIdMiddleware>();
-app.UseSerilogRequestLogging();
+app.UseMiddleware<Microsoft.Extensions.Hosting.CorrelationIdMiddleware>();
 app.UseExceptionHandler();
 
-if (app.Environment.IsDevelopment())
+if (app.Environment.IsDevelopment() || true)
 {
     app.UseSwagger();
     app.UseSwaggerUI(c =>
@@ -77,7 +68,8 @@ if (app.Environment.IsDevelopment())
     });
 }
 
-app.MapHealthChecks("/health");
+app.MapGet("/", () => Results.Redirect("/swagger"));
+app.MapDefaultEndpoints();
 app.MapControllers();
 
 app.Run();

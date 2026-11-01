@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using AutoMapper;
 using Catalog.Bll.DTOs;
 using Catalog.Bll.Specifications;
@@ -10,6 +11,8 @@ namespace Catalog.Bll.Services;
 
 public class ProductService : IProductService
 {
+    private static readonly ActivitySource Source = new("Catalog.Api");
+
     private readonly IUnitOfWork _uow;
     private readonly IMapper _mapper;
     private readonly ILogger<ProductService> _logger;
@@ -23,6 +26,10 @@ public class ProductService : IProductService
 
     public async Task<PagedResult<ProductDto>> GetPagedAsync(ProductQuery query, CancellationToken ct = default)
     {
+        using var activity = Source.StartActivity("GetProductsPaged");
+        activity?.SetTag("catalog.page", query.Page);
+        activity?.SetTag("catalog.pageSize", query.PageSize);
+
         // Нормалізація пагінації
         var page = query.Page < 1 ? 1 : query.Page;
         var pageSize = Math.Clamp(query.PageSize, 1, 100);
@@ -42,6 +49,9 @@ public class ProductService : IProductService
 
     public async Task<ProductDto> GetByIdAsync(long id, CancellationToken ct = default)
     {
+        using var activity = Source.StartActivity("GetProductById");
+        activity?.SetTag("product.id", id);
+
         var product = await _uow.Products.GetWithDetailsAsync(id, ct);
         if (product == null || product.IsDeleted)
         {
@@ -54,6 +64,10 @@ public class ProductService : IProductService
     public async Task<ProductDto> CreateAsync(CreateProductDto dto, string createdBy = "system", CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(dto);
+
+        using var activity = Source.StartActivity("CreateProduct");
+        activity?.SetTag("product.sku", dto.Sku);
+        activity?.SetTag("product.itemType", dto.ItemType);
 
         // Перевірка унікальності SKU (бізнес-правило BLL)
         var skuExists = await _uow.Products.ExistsBySkuAsync(dto.Sku, ct);
@@ -99,7 +113,16 @@ public class ProductService : IProductService
         await _uow.Products.AddAsync(product, ct);
         await _uow.SaveChangesAsync(ct);
 
-        _logger.LogInformation("Створено позицію каталогу '{Name}' (ID: {Id}, SKU: {Sku})", product.Name, product.Id, product.Sku);
+        activity?.SetTag("product.id", product.Id);
+        _logger.LogInformation(
+            "Product {ProductId} created (SKU: {Sku}, Name: {Name}, Price: {Amount}, Stock: {Stock}, Status: {Status})",
+            product.Id,
+            product.Sku,
+            product.Name,
+            product.Price,
+            product.StockQuantity,
+            product.IsActive ? "Active" : "Inactive");
+
         return _mapper.Map<ProductDto>(product);
     }
 
@@ -107,11 +130,17 @@ public class ProductService : IProductService
     {
         ArgumentNullException.ThrowIfNull(dto);
 
+        using var activity = Source.StartActivity("UpdateProductPrice");
+        activity?.SetTag("product.id", id);
+        activity?.SetTag("product.newPrice", dto.NewPrice);
+
         var product = await _uow.Products.GetWithDetailsAsync(id, ct);
         if (product == null || product.IsDeleted)
         {
             throw new EntityNotFoundException(nameof(Product), id);
         }
+
+        var oldPrice = product.Price;
 
         // Інкапсульоване доменне правило зміни ціни (перевіряє > 0 та фіксує PriceHistory)
         product.ChangePrice(dto.NewPrice, updatedBy, dto.Reason);
@@ -119,12 +148,21 @@ public class ProductService : IProductService
         _uow.Products.Update(product);
         await _uow.SaveChangesAsync(ct);
 
-        _logger.LogInformation("Змінено ціну товару ID {Id} на {NewPrice}", id, dto.NewPrice);
+        _logger.LogInformation(
+            "Product {ProductId} price updated from {OldAmount} to {Amount}, Status {Status}",
+            id,
+            oldPrice,
+            dto.NewPrice,
+            product.IsActive ? "Active" : "Inactive");
     }
 
     public async Task RemoveStockAsync(long id, RemoveStockDto dto, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(dto);
+
+        using var activity = Source.StartActivity("RemoveProductStock");
+        activity?.SetTag("product.id", id);
+        activity?.SetTag("product.quantity", dto.Quantity);
 
         var product = await _uow.Products.GetByIdAsync(id, ct);
         if (product == null || product.IsDeleted)
@@ -138,12 +176,21 @@ public class ProductService : IProductService
         _uow.Products.Update(product);
         await _uow.SaveChangesAsync(ct);
 
-        _logger.LogInformation("Списано залишок товару ID {Id} на кількість {Quantity}. Новий залишок: {Stock}", id, dto.Quantity, product.StockQuantity);
+        _logger.LogInformation(
+            "Product {ProductId} stock decreased by {Quantity}. Remaining stock: {Stock}, Status {Status}",
+            id,
+            dto.Quantity,
+            product.StockQuantity,
+            product.IsActive ? "Active" : "Inactive");
     }
 
     public async Task AddStockAsync(long id, AddStockDto dto, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(dto);
+
+        using var activity = Source.StartActivity("AddProductStock");
+        activity?.SetTag("product.id", id);
+        activity?.SetTag("product.quantity", dto.Quantity);
 
         var product = await _uow.Products.GetByIdAsync(id, ct);
         if (product == null || product.IsDeleted)
@@ -156,11 +203,19 @@ public class ProductService : IProductService
         _uow.Products.Update(product);
         await _uow.SaveChangesAsync(ct);
 
-        _logger.LogInformation("Поповнено залишок товару ID {Id} на кількість {Quantity}. Новий залишок: {Stock}", id, dto.Quantity, product.StockQuantity);
+        _logger.LogInformation(
+            "Product {ProductId} stock increased by {Quantity}. New stock: {Stock}, Status {Status}",
+            id,
+            dto.Quantity,
+            product.StockQuantity,
+            product.IsActive ? "Active" : "Inactive");
     }
 
     public async Task DeleteAsync(long id, string deletedBy = "system", CancellationToken ct = default)
     {
+        using var activity = Source.StartActivity("DeleteProduct");
+        activity?.SetTag("product.id", id);
+
         var product = await _uow.Products.GetByIdAsync(id, ct);
         if (product == null || product.IsDeleted)
         {
@@ -172,7 +227,7 @@ public class ProductService : IProductService
         _uow.Products.Update(product);
         await _uow.SaveChangesAsync(ct);
 
-        _logger.LogInformation("М'яко видалено товар ID {Id}", id);
+        _logger.LogInformation("Product {ProductId} soft deleted, Status {Status}", id, "Deleted");
     }
 
     public async Task<IReadOnlyList<ProductDto>> GetByCategoryAsync(long categoryId, CancellationToken ct = default)

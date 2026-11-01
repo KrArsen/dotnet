@@ -1,4 +1,5 @@
 using System.Data;
+using System.Diagnostics;
 using AutoMapper;
 using Microsoft.Extensions.Logging;
 using Sales.Bll.Dto;
@@ -25,6 +26,8 @@ public interface IDealService
 
 public class DealService : IDealService
 {
+    private static readonly ActivitySource Source = new("Sales.Api");
+
     private readonly IUnitOfWork _uow;
     private readonly IMapper _mapper;
     private readonly IDealValidator _validator;
@@ -44,6 +47,10 @@ public class DealService : IDealService
 
     public async Task<DealDto?> GetByIdAsync(long id, CancellationToken ct = default)
     {
+        using var activity = Source.StartActivity("GetDealById");
+        activity?.SetTag("order.id", id);
+        activity?.SetTag("deal.id", id);
+
         var deal = await _uow.Deals.GetWithDetailsAsync(id, ct);
         if (deal == null || deal.IsDeleted)
         {
@@ -69,6 +76,11 @@ public class DealService : IDealService
 
     public async Task<DealDto> CreateAsync(CreateDealDto dto, string createdBy, CancellationToken ct = default)
     {
+        using var activity = Source.StartActivity("CreateDeal");
+        activity?.SetTag("deal.clientId", dto.ClientId);
+        activity?.SetTag("deal.ownerId", dto.OwnerId);
+        activity?.SetTag("deal.itemsCount", dto.Items.Count);
+
         // Рівень 2: Бізнес-валідація перед транзакцією
         await _validator.ValidateCreateAsync(dto, ct);
 
@@ -128,12 +140,25 @@ public class DealService : IDealService
             }
 
             await _uow.CommitAsync(ct);
-            _logger?.LogInformation("Deal {DealId} created successfully in transaction", newDealId);
+
+            activity?.SetTag("order.id", newDealId);
+            activity?.SetTag("deal.id", newDealId);
+            activity?.SetTag("deal.status", created.Stage);
+
+            _logger?.LogInformation(
+                "Order {OrderId} (Deal {DealId}) created for Client {ClientId}, {ItemsCount} items, Amount {Amount}, status {Status}",
+                newDealId,
+                newDealId,
+                created.ClientId,
+                items.Count,
+                created.TotalAmount,
+                created.Stage);
+
             return _mapper.Map<DealDto>(created);
         }
         catch (Exception ex)
         {
-            _logger?.LogError(ex, "Failed to create deal, rolling back transaction");
+            _logger?.LogError(ex, "Failed to create deal for Client {ClientId}, rolling back transaction", dto.ClientId);
             await _uow.RollbackAsync(ct);
             throw;
         }
@@ -141,6 +166,10 @@ public class DealService : IDealService
 
     public async Task<bool> AddItemAsync(long dealId, AddDealItemDto dto, string addedBy, CancellationToken ct = default)
     {
+        using var activity = Source.StartActivity("AddDealItem");
+        activity?.SetTag("order.id", dealId);
+        activity?.SetTag("product.id", dto.ProductId);
+
         var deal = await _uow.Deals.GetWithDetailsAsync(dealId, ct);
         if (deal == null || deal.IsDeleted)
         {
@@ -169,28 +198,48 @@ public class DealService : IDealService
         // знімок на момент додавання, політика дублювання Лаб. 01, не оновлюється
         await _validator.ValidateAddItemAsync(dealId, dto, ct);
 
-        return await _uow.Deals.AddItemAsync(
+        var added = await _uow.Deals.AddItemAsync(
             dealId,
             dto.ProductId,
             dto.Quantity,
             dto.Discount,
             string.IsNullOrWhiteSpace(addedBy) ? "system" : addedBy,
             ct);
+
+        _logger?.LogInformation(
+            "Added item Product {ProductId} (Qty: {Quantity}) to Order {OrderId}, status {Status}",
+            dto.ProductId,
+            dto.Quantity,
+            dealId,
+            deal.Stage);
+
+        return added;
     }
 
     public async Task<bool> AdvanceAsync(long dealId, string changedBy, string? reason, CancellationToken ct = default)
     {
+        using var activity = Source.StartActivity("AdvanceDealStage");
+        activity?.SetTag("order.id", dealId);
+
         var deal = await _uow.Deals.GetWithDetailsAsync(dealId, ct);
         if (deal == null || deal.IsDeleted)
         {
             throw new NotFoundException("Deal", dealId);
         }
 
-        return await _uow.Deals.AdvanceAsync(
+        var result = await _uow.Deals.AdvanceAsync(
             dealId,
             string.IsNullOrWhiteSpace(changedBy) ? "system" : changedBy,
             reason,
             ct);
+
+        _logger?.LogInformation(
+            "Order {OrderId} advanced from stage {OldStatus} by {UserId}",
+            dealId,
+            deal.Stage,
+            changedBy);
+
+        return result;
     }
 
     /// <summary>
@@ -203,6 +252,10 @@ public class DealService : IDealService
     /// </summary>
     public async Task<bool> WinDealAsync(long dealId, string performedBy, CancellationToken ct = default)
     {
+        using var activity = Source.StartActivity("ConfirmOrder");
+        activity?.SetTag("order.id", dealId);
+        activity?.SetTag("deal.id", dealId);
+
         await _uow.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
         try
         {
@@ -229,7 +282,16 @@ public class DealService : IDealService
 
             // 4. Фіксація транзакції
             await _uow.CommitAsync(ct);
-            _logger?.LogInformation("Deal {DealId} won successfully in dual-repo transaction for client {ClientId}", dealId, deal.ClientId);
+
+            activity?.SetTag("order.status", "Won");
+            _logger?.LogInformation(
+                "Order {OrderId} confirmed, {ItemsCount} items, Amount {Amount}, status {Status} for Client {ClientId}",
+                dealId,
+                deal.Items.Count,
+                deal.TotalAmount,
+                "Won",
+                deal.ClientId);
+
             return true;
         }
         catch (Exception ex)
@@ -242,6 +304,9 @@ public class DealService : IDealService
 
     public async Task<bool> LoseAsync(long dealId, LoseDealDto dto, string changedBy, CancellationToken ct = default)
     {
+        using var activity = Source.StartActivity("LoseDeal");
+        activity?.SetTag("order.id", dealId);
+
         var deal = await _uow.Deals.GetWithDetailsAsync(dealId, ct);
         if (deal == null || deal.IsDeleted)
         {
@@ -253,11 +318,19 @@ public class DealService : IDealService
             throw new BusinessConflictException($"Cannot mark as lost deal in closed stage '{deal.Stage}'.");
         }
 
-        return await _uow.Deals.LoseAsync(
+        var lost = await _uow.Deals.LoseAsync(
             dealId,
             dto.Reason,
             string.IsNullOrWhiteSpace(changedBy) ? "system" : changedBy,
             ct);
+
+        _logger?.LogInformation(
+            "Order {OrderId} marked as {Status}, reason: {Reason}",
+            dealId,
+            "Lost",
+            dto.Reason);
+
+        return lost;
     }
 
     public async Task<bool> SoftDeleteAsync(long id, string deletedBy, CancellationToken ct = default)

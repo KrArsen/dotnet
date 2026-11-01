@@ -10,6 +10,7 @@
   <ItemGroup>
     <ProjectReference Include="..\Activities.Application\Activities.Application.csproj" />
     <ProjectReference Include="..\Activities.Infrastructure\Activities.Infrastructure.csproj" />
+    <ProjectReference Include="..\..\..\Platform.ServiceDefaults\Platform.ServiceDefaults.csproj" />
   </ItemGroup>
 
   <ItemGroup>

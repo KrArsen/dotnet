@@ -1,5 +1,4 @@
 using Catalog.Api.Middleware;
-using Catalog.Api.Validators;
 using Catalog.Bll.Caching;
 using Catalog.Bll.Mapping;
 using Catalog.Bll.Services;
@@ -11,26 +10,17 @@ using FluentValidation;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.OpenApi.Models;
-using Serilog;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// 1. Serilog структуроване логування
-builder.Host.UseSerilog((context, services, configuration) =>
-{
-    configuration
-        .ReadFrom.Configuration(context.Configuration)
-        .ReadFrom.Services(services)
-        .MinimumLevel.Override("Microsoft.EntityFrameworkCore.Database.Command", Serilog.Events.LogEventLevel.Information)
-        .Enrich.FromLogContext()
-        .WriteTo.Console(outputTemplate: "[{Timestamp:HH:mm:ss} {Level:u3}] ({CorrelationId}) {Message:lj}{NewLine}{Exception}");
-});
+// 1. Централізовані налаштування платформи .NET Aspire (Serilog, OpenTelemetry, HealthChecks, ServiceDiscovery)
+builder.AddServiceDefaults();
 
 // 2. Глобальна обробка винятків у форматі ProblemDetails (RFC 7807/9457)
 builder.Services.AddExceptionHandler<GlobalExceptionHandler>();
 builder.Services.AddProblemDetails();
 
-// 3. Підключення до бази даних CatalogDb через EF Core SQL Server
+// 3. Підключення до бази даних CatalogDb через EF Core SQL Server (рядок підключення від Aspire або appsettings.json)
 var connectionString = builder.Configuration.GetConnectionString("CatalogDb")
     ?? "Server=127.0.0.1,1433;Database=CatalogDb;User Id=sa;Password=Your_Strong_Password_123!;TrustServerCertificate=True";
 
@@ -78,7 +68,7 @@ builder.Services.AddSwaggerGen(c =>
     {
         Title = "Catalog Microservice API (CRM Small Business)",
         Version = "v1",
-        Description = "Лабораторна робота №03: Мікросервіс Catalog на EF Core Code-First (тришарова архітектура, Unit of Work, DTO + AutoMapper, Specification pattern, Serilog, ProblemDetails)."
+        Description = "Лабораторна робота №03 / №05: Мікросервіс Catalog на EF Core Code-First (тришарова архітектура, Unit of Work, DTO + AutoMapper, Specification pattern, Serilog, ProblemDetails)."
     });
 
     c.AddSecurityDefinition("CorrelationId", new OpenApiSecurityScheme
@@ -93,8 +83,7 @@ builder.Services.AddSwaggerGen(c =>
 var app = builder.Build();
 
 // 10. HTTP Pipeline
-app.UseMiddleware<CorrelationIdMiddleware>();
-app.UseSerilogRequestLogging();
+app.UseMiddleware<Microsoft.Extensions.Hosting.CorrelationIdMiddleware>();
 app.UseExceptionHandler();
 app.UseStatusCodePages();
 
@@ -108,6 +97,7 @@ if (app.Environment.IsDevelopment() || true) // Дозволяємо Swagger д�
 }
 
 app.MapGet("/", () => Results.Redirect("/swagger"));
+app.MapDefaultEndpoints();
 app.MapControllers();
 
 // 11. Автоматичне застосування міграцій та програмний сідінг у scope

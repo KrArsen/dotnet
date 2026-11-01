@@ -16,8 +16,20 @@ public static class DependencyInjection
         // 1. Реєстрація мапінгів BSON (виконується одноразово при старті)
         MongoMappings.Register();
 
-        // 2. Налаштування параметрів MongoDB
+        // 2. Налаштування параметрів MongoDB (із підтримкою рядків підключення від .NET Aspire)
         services.Configure<MongoDbOptions>(configuration.GetSection(MongoDbOptions.SectionName));
+        services.PostConfigure<MongoDbOptions>(options =>
+        {
+            var aspireConnectionString =
+                configuration.GetConnectionString("ActivitiesDb") ??
+                configuration.GetConnectionString("ReviewsDb") ??
+                configuration.GetConnectionString("mongo");
+
+            if (!string.IsNullOrWhiteSpace(aspireConnectionString))
+            {
+                options.ConnectionString = aspireConnectionString;
+            }
+        });
 
         // 3. Singleton контекст доступу до MongoDB
         services.AddSingleton<MongoDbContext>();
