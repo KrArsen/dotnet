@@ -1,5 +1,8 @@
 using Microsoft.Extensions.Options;
 using Microsoft.OpenApi.Models;
+using Sales.Api.HealthChecks;
+using Sales.Api.Metrics;
+using Sales.Api.Middleware;
 using Sales.Bll.Caching;
 using Sales.Bll.Mapping;
 using Sales.Bll.Services;
@@ -7,7 +10,6 @@ using Sales.Bll.Validation;
 using Sales.Dal.Interfaces;
 using Sales.Dal.Options;
 using Sales.Dal.UnitOfWork;
-using Sales.Api.Middleware;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -64,12 +66,18 @@ builder.Services.AddScoped(sp => sp.GetRequiredService<IUnitOfWork>().Products);
 builder.Services.AddScoped(sp => sp.GetRequiredService<IUnitOfWork>().TeamMembers);
 
 // Дворівневе кешування: L1 (IMemoryCache з обмеженням SizeLimit) + L2 (IDistributedCache поверх Redis через Aspire)
-builder.AddRedisDistributedCache("redis");
+// DisableHealthChecks = true вимикає стандартну Unhealthy-перевірку Aspire, щоб діяла наша Degraded-перевірка redis-cache
+builder.AddRedisDistributedCache("redis", configureSettings: settings => settings.DisableHealthChecks = true);
 builder.Services.AddMemoryCache(o => o.SizeLimit = 10_000);
 builder.Services.AddSingleton<IIdempotencyStore, MemoryIdempotencyStore>();
 builder.Services.AddSingleton<SalesCacheMetrics>();
 builder.Services.AddSingleton<Sales.Api.Metrics.CacheMetrics>();
+builder.Services.AddSingleton<OrderMetrics>();
 builder.Services.AddScoped<SalesTwoLevelCacheService>();
+
+// Health Checks для SQL Server (orders-db), Redis (redis-cache: Degraded) та gRPC Health Checking Protocol
+var redisConnectionString = builder.Configuration.GetConnectionString("redis") ?? "localhost:6379";
+builder.Services.AddSalesHealthChecks(connectionString, redisConnectionString);
 
 // Явна реєстрація валідаторів рівня 2 (Scoped)
 builder.Services.AddScoped<IClientValidator, ClientValidator>();
@@ -127,11 +135,12 @@ app.UseSwaggerUI(c =>
 // Перенаправлення з кореня на Swagger UI для зручності тестування
 app.MapGet("/", () => Results.Redirect("/swagger"));
 
-// Спільні ендпоінти платформи (/health та /alive)
+// Спільні ендпоінти платформи (/health, /health/live, /health/ready, /health/startup, /alive)
 app.MapDefaultEndpoints();
 
 app.MapControllers();
 app.MapGrpcService<Sales.Api.Grpc.OrdersGrpcService>();
+app.MapGrpcHealthChecksService();
 
 app.Run();
 

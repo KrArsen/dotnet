@@ -1,4 +1,6 @@
+using System.Diagnostics;
 using Microsoft.AspNetCore.Mvc;
+using Sales.Api.Metrics;
 using Sales.Bll.Caching;
 using Sales.Bll.Dto;
 using Sales.Bll.Services;
@@ -14,11 +16,16 @@ public class DealsController : ControllerBase
 {
     private readonly IDealService _dealService;
     private readonly IIdempotencyStore _idempotencyStore;
+    private readonly OrderMetrics? _metrics;
 
-    public DealsController(IDealService dealService, IIdempotencyStore idempotencyStore)
+    public DealsController(
+        IDealService dealService,
+        IIdempotencyStore idempotencyStore,
+        OrderMetrics? metrics = null)
     {
         _dealService = dealService ?? throw new ArgumentNullException(nameof(dealService));
         _idempotencyStore = idempotencyStore ?? throw new ArgumentNullException(nameof(idempotencyStore));
+        _metrics = metrics;
     }
 
     /// <summary>
@@ -30,8 +37,18 @@ public class DealsController : ControllerBase
         [FromQuery] DealQueryDto query,
         CancellationToken ct)
     {
-        var result = await _dealService.GetPageAsync(query, ct);
-        return Ok(result);
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            var result = await _dealService.GetPageAsync(query, ct);
+            _metrics?.RecordDuration("list", success: true, sw.Elapsed.TotalMilliseconds);
+            return Ok(result);
+        }
+        catch
+        {
+            _metrics?.RecordDuration("list", success: false, sw.Elapsed.TotalMilliseconds);
+            throw;
+        }
     }
 
     /// <summary>
@@ -42,13 +59,23 @@ public class DealsController : ControllerBase
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status404NotFound)]
     public async Task<ActionResult<DealDto>> GetById(long id, CancellationToken ct)
     {
-        var deal = await _dealService.GetByIdAsync(id, ct);
-        if (deal == null)
+        var sw = Stopwatch.StartNew();
+        try
         {
-            throw new NotFoundException($"Угоду з ID {id} не знайдено.");
-        }
+            var deal = await _dealService.GetByIdAsync(id, ct);
+            if (deal == null)
+            {
+                throw new NotFoundException($"Угоду з ID {id} не знайдено.");
+            }
 
-        return Ok(deal);
+            _metrics?.RecordDuration("get_by_id", success: true, sw.Elapsed.TotalMilliseconds);
+            return Ok(deal);
+        }
+        catch
+        {
+            _metrics?.RecordDuration("get_by_id", success: false, sw.Elapsed.TotalMilliseconds);
+            throw;
+        }
     }
 
     /// <summary>
@@ -88,14 +115,25 @@ public class DealsController : ControllerBase
             }
         }
 
-        var created = await _dealService.CreateAsync(dto, username, ct);
-
-        if (!string.IsNullOrWhiteSpace(idempotencyKey))
+        var sw = Stopwatch.StartNew();
+        try
         {
-            await _idempotencyStore.SetAsync(idempotencyKey, StatusCodes.Status201Created, created, ct: ct);
-        }
+            var created = await _dealService.CreateAsync(dto, username, ct);
 
-        return CreatedAtAction(nameof(GetById), new { id = created.Id }, created);
+            if (!string.IsNullOrWhiteSpace(idempotencyKey))
+            {
+                await _idempotencyStore.SetAsync(idempotencyKey, StatusCodes.Status201Created, created, ct: ct);
+            }
+
+            _metrics?.OrderCreated(created.Stage ?? "Lead");
+            _metrics?.RecordDuration("create", success: true, sw.Elapsed.TotalMilliseconds);
+            return CreatedAtAction(nameof(GetById), new { id = created.Id }, created);
+        }
+        catch
+        {
+            _metrics?.RecordDuration("create", success: false, sw.Elapsed.TotalMilliseconds);
+            throw;
+        }
     }
 
     /// <summary>
@@ -112,9 +150,19 @@ public class DealsController : ControllerBase
         [FromHeader(Name = "X-User")] string? user,
         CancellationToken ct)
     {
-        await _dealService.AddItemAsync(id, dto, user ?? "system", ct);
-        var updated = await _dealService.GetByIdAsync(id, ct);
-        return Ok(updated);
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            await _dealService.AddItemAsync(id, dto, user ?? "system", ct);
+            var updated = await _dealService.GetByIdAsync(id, ct);
+            _metrics?.RecordDuration("add_item", success: true, sw.Elapsed.TotalMilliseconds);
+            return Ok(updated);
+        }
+        catch
+        {
+            _metrics?.RecordDuration("add_item", success: false, sw.Elapsed.TotalMilliseconds);
+            throw;
+        }
     }
 
     /// <summary>
@@ -130,8 +178,18 @@ public class DealsController : ControllerBase
         [FromHeader(Name = "X-User")] string? user,
         CancellationToken ct)
     {
-        await _dealService.AdvanceAsync(id, user ?? "system", dto?.Reason, ct);
-        return NoContent();
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            await _dealService.AdvanceAsync(id, user ?? "system", dto?.Reason, ct);
+            _metrics?.RecordDuration("advance", success: true, sw.Elapsed.TotalMilliseconds);
+            return NoContent();
+        }
+        catch
+        {
+            _metrics?.RecordDuration("advance", success: false, sw.Elapsed.TotalMilliseconds);
+            throw;
+        }
     }
 
     /// <summary>
@@ -159,14 +217,25 @@ public class DealsController : ControllerBase
             }
         }
 
-        await _dealService.WinDealAsync(id, user ?? "system", ct);
-
-        if (!string.IsNullOrWhiteSpace(idempotencyKey))
+        var sw = Stopwatch.StartNew();
+        try
         {
-            await _idempotencyStore.SetAsync(idempotencyKey, StatusCodes.Status204NoContent, null, ct: ct);
-        }
+            await _dealService.WinDealAsync(id, user ?? "system", ct);
 
-        return NoContent();
+            if (!string.IsNullOrWhiteSpace(idempotencyKey))
+            {
+                await _idempotencyStore.SetAsync(idempotencyKey, StatusCodes.Status204NoContent, null, ct: ct);
+            }
+
+            _metrics?.OrderConfirmed();
+            _metrics?.RecordDuration("confirm", success: true, sw.Elapsed.TotalMilliseconds);
+            return NoContent();
+        }
+        catch
+        {
+            _metrics?.RecordDuration("confirm", success: false, sw.Elapsed.TotalMilliseconds);
+            throw;
+        }
     }
 
     /// <summary>
@@ -183,8 +252,19 @@ public class DealsController : ControllerBase
         [FromHeader(Name = "X-User")] string? user,
         CancellationToken ct)
     {
-        await _dealService.LoseAsync(id, dto, user ?? "system", ct);
-        return NoContent();
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            await _dealService.LoseAsync(id, dto, user ?? "system", ct);
+            _metrics?.OrderLost();
+            _metrics?.RecordDuration("lose", success: true, sw.Elapsed.TotalMilliseconds);
+            return NoContent();
+        }
+        catch
+        {
+            _metrics?.RecordDuration("lose", success: false, sw.Elapsed.TotalMilliseconds);
+            throw;
+        }
     }
 
     /// <summary>
@@ -199,7 +279,17 @@ public class DealsController : ControllerBase
         [FromHeader(Name = "X-User")] string? user,
         CancellationToken ct)
     {
-        await _dealService.SoftDeleteAsync(id, user ?? "system", ct);
-        return NoContent();
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            await _dealService.SoftDeleteAsync(id, user ?? "system", ct);
+            _metrics?.RecordDuration("delete", success: true, sw.Elapsed.TotalMilliseconds);
+            return NoContent();
+        }
+        catch
+        {
+            _metrics?.RecordDuration("delete", success: false, sw.Elapsed.TotalMilliseconds);
+            throw;
+        }
     }
 }

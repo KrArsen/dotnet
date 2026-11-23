@@ -1,8 +1,10 @@
 using Activities.Application;
 using Activities.Application.Common.Mappings;
 using Activities.Infrastructure;
-using Activities.WebApi.Middleware;
+using Activities.WebApi.HealthChecks;
 using Activities.WebApi.Mapping;
+using Activities.WebApi.Metrics;
+using Activities.WebApi.Middleware;
 using Microsoft.OpenApi.Models;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -15,9 +17,11 @@ builder.Services.AddExceptionHandler<GlobalExceptionHandler>();
 builder.Services.AddProblemDetails();
 
 // 3. Розподілений кеш Redis через Aspire + шар Application (MediatR, Pipeline Behaviors, L1+L2 Caching, FluentValidation)
-builder.AddRedisDistributedCache("redis");
+// DisableHealthChecks = true вимикає стандартну Unhealthy-перевірку Aspire, щоб діяла наша Degraded-перевірка redis-cache
+builder.AddRedisDistributedCache("redis", configureSettings: settings => settings.DisableHealthChecks = true);
 builder.Services.AddMemoryCache(o => o.SizeLimit = 10_000);
 builder.Services.AddSingleton<Activities.WebApi.Metrics.CacheMetrics>();
+builder.Services.AddSingleton<ReviewMetrics>();
 builder.Services.AddApplication(builder.Configuration);
 
 // 4. Реєстрація шару Infrastructure (MongoDB Driver, Context, Repositories, Queries, Seeding)
@@ -55,12 +59,9 @@ builder.Services.AddSwaggerGen(options =>
     });
 });
 
-// 7. Health Check для MongoDB (інтегрується з MapDefaultEndpoints /health)
-builder.Services.AddHealthChecks()
-    .AddMongoDb(
-        sp => sp.GetRequiredService<Activities.Infrastructure.Persistence.MongoDbContext>().Database.Client,
-        name: "mongodb",
-        tags: new[] { "db", "ready" });
+// 7. Комплексні Health Checks: MongoDB (reviews-db), Redis (redis-cache: Degraded) та gRPC Health Checking Protocol
+var redisConnectionString = builder.Configuration.GetConnectionString("redis") ?? "localhost:6379";
+builder.Services.AddActivitiesHealthChecks(redisConnectionString);
 
 var app = builder.Build();
 
@@ -82,5 +83,6 @@ app.MapGet("/", () => Results.Redirect("/swagger"));
 app.MapDefaultEndpoints();
 app.MapControllers();
 app.MapGrpcService<Activities.WebApi.Grpc.ReviewsGrpcService>();
+app.MapGrpcHealthChecksService();
 
 app.Run();

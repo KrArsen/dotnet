@@ -3,6 +3,7 @@ using System.Text.Json;
 using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Logging;
+using StackExchange.Redis;
 
 namespace Catalog.Bll.Caching;
 
@@ -22,7 +23,8 @@ public interface ITwoLevelCacheService
 
 /// <summary>
 /// Дворівневий кеш: L1 (IMemoryCache у пам'яті процесу) -> L2 (IDistributedCache у Redis) -> БД.
-/// Реалізує патерн Cache-Aside із заповненням рівнів на зворотному шляху та метриками OpenTelemetry.
+/// Реалізує патерн Cache-Aside із graceful degradation при недоступності Redis (перехоплення
+/// RedisConnectionException / RedisTimeoutException із запасним читанням із БД).
 /// </summary>
 public sealed class TwoLevelCacheService : ITwoLevelCacheService
 {
@@ -73,34 +75,40 @@ public sealed class TwoLevelCacheService : ITwoLevelCacheService
         _metrics.Miss("L1");
         _logger.LogDebug("Cache {Outcome} ({Level}) for {Key}", "MISS", "L1", key);
 
-        // 2. Перевірка рівня L2 (розподілений кеш Redis)
+        // 2. Перевірка рівня L2 (розподілений кеш Redis) з graceful degradation
+        byte[]? bytes = null;
         try
         {
-            var bytes = await _redis.GetAsync(key, ct);
-            if (bytes is { Length: > 0 })
-            {
-                _metrics.Hit("L2");
-                activity?.SetTag("cache.level", "L2");
-                activity?.SetTag("cache.hit", true);
-                _logger.LogInformation("Cache {Outcome} ({Level}) for {Key}", "HIT", "L2", key);
-
-                var fromRedis = JsonSerializer.Deserialize<T>(bytes, JsonOptions);
-                if (fromRedis is not null)
-                {
-                    // Заповнюємо L1 на зворотному шляху з коротшим TTL ніж L2
-                    _memory.Set(key, fromRedis, new MemoryCacheEntryOptions
-                    {
-                        Size = size,
-                        SlidingExpiration = sliding,
-                        AbsoluteExpirationRelativeToNow = l1Ttl
-                    });
-                    return fromRedis;
-                }
-            }
+            bytes = await _redis.GetAsync(key, ct);
+        }
+        catch (Exception ex) when (ex is RedisConnectionException or RedisTimeoutException)
+        {
+            _logger.LogWarning(ex, "Redis unavailable, falling back to database for {Key}", key);
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Redis L2 cache read failed for {Key}; falling back to database", key);
+        }
+
+        if (bytes is { Length: > 0 })
+        {
+            _metrics.Hit("L2");
+            activity?.SetTag("cache.level", "L2");
+            activity?.SetTag("cache.hit", true);
+            _logger.LogInformation("Cache {Outcome} ({Level}) for {Key}", "HIT", "L2", key);
+
+            var fromRedis = JsonSerializer.Deserialize<T>(bytes, JsonOptions);
+            if (fromRedis is not null)
+            {
+                // Заповнюємо L1 на зворотному шляху з коротшим TTL ніж L2
+                _memory.Set(key, fromRedis, new MemoryCacheEntryOptions
+                {
+                    Size = size,
+                    SlidingExpiration = sliding,
+                    AbsoluteExpirationRelativeToNow = l1Ttl
+                });
+                return fromRedis;
+            }
         }
 
         _metrics.Miss("L2");
@@ -126,6 +134,10 @@ public sealed class TwoLevelCacheService : ITwoLevelCacheService
                     AbsoluteExpirationRelativeToNow = l2Ttl
                 },
                 ct);
+        }
+        catch (Exception ex) when (ex is RedisConnectionException or RedisTimeoutException)
+        {
+            _logger.LogWarning(ex, "Redis unavailable, value for {Key} not cached in L2", key);
         }
         catch (Exception ex)
         {
@@ -153,6 +165,10 @@ public sealed class TwoLevelCacheService : ITwoLevelCacheService
         try
         {
             await _redis.RemoveAsync(key, ct);
+        }
+        catch (Exception ex) when (ex is RedisConnectionException or RedisTimeoutException)
+        {
+            _logger.LogWarning(ex, "Redis unavailable during cache invalidation for {Key}", key);
         }
         catch (Exception ex)
         {

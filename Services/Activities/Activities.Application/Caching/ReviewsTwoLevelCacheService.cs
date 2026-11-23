@@ -6,7 +6,8 @@ using Microsoft.Extensions.Logging;
 namespace Activities.Application.Caching;
 
 /// <summary>
-/// Дворівневий кеш (L1 IMemoryCache -> L2 Redis IDistributedCache -> MongoDB) для сервісу Reviews/Activities.
+/// Дворівневий кеш (L1 IMemoryCache -> L2 Redis IDistributedCache -> MongoDB) для сервісу Reviews/Activities
+/// із graceful degradation при недоступності Redis.
 /// </summary>
 public sealed class ReviewsTwoLevelCacheService
 {
@@ -51,30 +52,36 @@ public sealed class ReviewsTwoLevelCacheService
 
         if (_redis is not null)
         {
+            byte[]? bytes = null;
             try
             {
-                var bytes = await _redis.GetAsync(key, ct);
-                if (bytes is { Length: > 0 })
-                {
-                    _metrics.Hit("L2");
-                    _logger.LogInformation("Cache {Outcome} ({Level}) for {Key}", "HIT", "L2", key);
-
-                    var fromRedis = JsonSerializer.Deserialize<T>(bytes, JsonOptions);
-                    if (fromRedis is not null)
-                    {
-                        _memory.Set(key, fromRedis, new MemoryCacheEntryOptions
-                        {
-                            Size = size,
-                            SlidingExpiration = sliding,
-                            AbsoluteExpirationRelativeToNow = l1Ttl
-                        });
-                        return fromRedis;
-                    }
-                }
+                bytes = await _redis.GetAsync(key, ct);
+            }
+            catch (Exception ex) when (ex is TimeoutException || ex.GetType().Name.StartsWith("Redis", StringComparison.Ordinal))
+            {
+                _logger.LogWarning(ex, "Redis unavailable, falling back to MongoDB for {Key}", key);
             }
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "Redis L2 read failed for {Key}; falling back to MongoDB", key);
+            }
+
+            if (bytes is { Length: > 0 })
+            {
+                _metrics.Hit("L2");
+                _logger.LogInformation("Cache {Outcome} ({Level}) for {Key}", "HIT", "L2", key);
+
+                var fromRedis = JsonSerializer.Deserialize<T>(bytes, JsonOptions);
+                if (fromRedis is not null)
+                {
+                    _memory.Set(key, fromRedis, new MemoryCacheEntryOptions
+                    {
+                        Size = size,
+                        SlidingExpiration = sliding,
+                        AbsoluteExpirationRelativeToNow = l1Ttl
+                    });
+                    return fromRedis;
+                }
             }
         }
 
@@ -97,6 +104,10 @@ public sealed class ReviewsTwoLevelCacheService
                     serialized,
                     new DistributedCacheEntryOptions { AbsoluteExpirationRelativeToNow = l2Ttl },
                     ct);
+            }
+            catch (Exception ex) when (ex is TimeoutException || ex.GetType().Name.StartsWith("Redis", StringComparison.Ordinal))
+            {
+                _logger.LogWarning(ex, "Redis unavailable, value for {Key} not cached in L2", key);
             }
             catch (Exception ex)
             {
@@ -123,6 +134,10 @@ public sealed class ReviewsTwoLevelCacheService
             try
             {
                 await _redis.RemoveAsync(key, ct);
+            }
+            catch (Exception ex) when (ex is TimeoutException || ex.GetType().Name.StartsWith("Redis", StringComparison.Ordinal))
+            {
+                _logger.LogWarning(ex, "Redis unavailable during cache invalidation for {Key}", key);
             }
             catch (Exception ex)
             {

@@ -4,6 +4,8 @@ var builder = WebApplication.CreateBuilder(args);
 
 // 1. Централізовані налаштування платформи (Serilog, OpenTelemetry, HealthChecks, ServiceDiscovery)
 builder.AddServiceDefaults();
+builder.Services.AddHealthChecks()
+    .AddCheck("gateway-proxy", () => Microsoft.Extensions.Diagnostics.HealthChecks.HealthCheckResult.Healthy("YARP reverse proxy is ready"), ["ready"]);
 
 // 2. Реєстрація YARP Reverse Proxy з конфігурації та інтеграція з Aspire Service Discovery
 builder.Services.AddReverseProxy()
@@ -90,7 +92,7 @@ app.MapGet("/", () => Results.Ok(new
     }
 }));
 
-app.MapReverseProxy();
 app.MapDefaultEndpoints();
+app.MapReverseProxy();
 
 app.Run();

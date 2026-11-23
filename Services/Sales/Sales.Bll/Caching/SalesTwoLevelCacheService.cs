@@ -2,11 +2,13 @@ using System.Text.Json;
 using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Logging;
+using StackExchange.Redis;
 
 namespace Sales.Bll.Caching;
 
 /// <summary>
-/// Дворівневий кеш (L1 IMemoryCache -> L2 Redis IDistributedCache -> БД) для сервісу Sales/Orders.
+/// Дворівневий кеш (L1 IMemoryCache -> L2 Redis IDistributedCache -> БД) для сервісу Sales/Orders
+/// із graceful degradation при недоступності Redis.
 /// </summary>
 public sealed class SalesTwoLevelCacheService
 {
@@ -49,30 +51,36 @@ public sealed class SalesTwoLevelCacheService
 
         _metrics.Miss("L1");
 
+        byte[]? bytes = null;
         try
         {
-            var bytes = await _redis.GetAsync(key, ct);
-            if (bytes is { Length: > 0 })
-            {
-                _metrics.Hit("L2");
-                _logger.LogInformation("Cache {Outcome} ({Level}) for {Key}", "HIT", "L2", key);
-
-                var fromRedis = JsonSerializer.Deserialize<T>(bytes, JsonOptions);
-                if (fromRedis is not null)
-                {
-                    _memory.Set(key, fromRedis, new MemoryCacheEntryOptions
-                    {
-                        Size = size,
-                        SlidingExpiration = sliding,
-                        AbsoluteExpirationRelativeToNow = l1Ttl
-                    });
-                    return fromRedis;
-                }
-            }
+            bytes = await _redis.GetAsync(key, ct);
+        }
+        catch (Exception ex) when (ex is RedisConnectionException or RedisTimeoutException)
+        {
+            _logger.LogWarning(ex, "Redis unavailable, falling back to database for {Key}", key);
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Redis L2 read failed for {Key}; falling back to database", key);
+        }
+
+        if (bytes is { Length: > 0 })
+        {
+            _metrics.Hit("L2");
+            _logger.LogInformation("Cache {Outcome} ({Level}) for {Key}", "HIT", "L2", key);
+
+            var fromRedis = JsonSerializer.Deserialize<T>(bytes, JsonOptions);
+            if (fromRedis is not null)
+            {
+                _memory.Set(key, fromRedis, new MemoryCacheEntryOptions
+                {
+                    Size = size,
+                    SlidingExpiration = sliding,
+                    AbsoluteExpirationRelativeToNow = l1Ttl
+                });
+                return fromRedis;
+            }
         }
 
         _metrics.Miss("L2");
@@ -92,6 +100,10 @@ public sealed class SalesTwoLevelCacheService
                 serialized,
                 new DistributedCacheEntryOptions { AbsoluteExpirationRelativeToNow = l2Ttl },
                 ct);
+        }
+        catch (Exception ex) when (ex is RedisConnectionException or RedisTimeoutException)
+        {
+            _logger.LogWarning(ex, "Redis unavailable, value for {Key} not cached in L2", key);
         }
         catch (Exception ex)
         {
@@ -115,6 +127,10 @@ public sealed class SalesTwoLevelCacheService
         try
         {
             await _redis.RemoveAsync(key, ct);
+        }
+        catch (Exception ex) when (ex is RedisConnectionException or RedisTimeoutException)
+        {
+            _logger.LogWarning(ex, "Redis unavailable during cache invalidation for {Key}", key);
         }
         catch (Exception ex)
         {

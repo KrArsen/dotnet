@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Activities.Application.Activities.Commands.AddComment;
 using Activities.Application.Activities.Commands.CreateActivity;
 using Activities.Application.Activities.Commands.DeleteActivity;
@@ -6,6 +7,7 @@ using Activities.Application.Activities.Queries.GetActivitiesList;
 using Activities.Application.Activities.Queries.GetActivityById;
 using Activities.Application.Common.Models;
 using Activities.WebApi.Contracts;
+using Activities.WebApi.Metrics;
 using AutoMapper;
 using Microsoft.AspNetCore.Mvc;
 
@@ -15,10 +17,12 @@ namespace Activities.WebApi.Controllers;
 public class ActivitiesController : ApiControllerBase
 {
     private readonly IMapper _mapper;
+    private readonly ReviewMetrics? _metrics;
 
-    public ActivitiesController(IMapper mapper)
+    public ActivitiesController(IMapper mapper, ReviewMetrics? metrics = null)
     {
         _mapper = mapper ?? throw new ArgumentNullException(nameof(mapper));
+        _metrics = metrics;
     }
 
     /// <summary>
@@ -37,9 +41,24 @@ public class ActivitiesController : ApiControllerBase
         [FromQuery] int pageSize = 20,
         CancellationToken ct = default)
     {
-        var query = new GetActivitiesListQuery(clientId, type, userId, search, productId, page, pageSize);
-        var result = await Sender.Send(query, ct);
-        return Ok(result);
+        _metrics?.RequestStarted();
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            var query = new GetActivitiesListQuery(clientId, type, userId, search, productId, page, pageSize);
+            var result = await Sender.Send(query, ct);
+            _metrics?.RecordDuration("list_activities", success: true, sw.Elapsed.TotalMilliseconds);
+            return Ok(result);
+        }
+        catch
+        {
+            _metrics?.RecordDuration("list_activities", success: false, sw.Elapsed.TotalMilliseconds);
+            throw;
+        }
+        finally
+        {
+            _metrics?.RequestCompleted();
+        }
     }
 
     /// <summary>
@@ -51,13 +70,26 @@ public class ActivitiesController : ApiControllerBase
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status404NotFound)]
     public async Task<ActionResult<ActivityDto>> GetById(string id, CancellationToken ct)
     {
-        var query = new GetActivityByIdQuery(id);
-        var result = await Sender.Send(query, ct);
+        _metrics?.RequestStarted();
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            var query = new GetActivityByIdQuery(id);
+            var result = await Sender.Send(query, ct);
 
-        // Передача актуальної версії документа у HTTP-заголовку ETag
-        Response.Headers.ETag = $"\"{result.Version}\"";
-
-        return Ok(result);
+            Response.Headers.ETag = $"\"{result.Version}\"";
+            _metrics?.RecordDuration("get_activity", success: true, sw.Elapsed.TotalMilliseconds);
+            return Ok(result);
+        }
+        catch
+        {
+            _metrics?.RecordDuration("get_activity", success: false, sw.Elapsed.TotalMilliseconds);
+            throw;
+        }
+        finally
+        {
+            _metrics?.RequestCompleted();
+        }
     }
 
     /// <summary>
@@ -71,10 +103,26 @@ public class ActivitiesController : ApiControllerBase
         [FromBody] CreateActivityRequest request,
         CancellationToken ct)
     {
-        var command = _mapper.Map<CreateActivityCommand>(request);
-        var id = await Sender.Send(command, ct);
+        _metrics?.RequestStarted();
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            var command = _mapper.Map<CreateActivityCommand>(request);
+            var id = await Sender.Send(command, ct);
 
-        return CreatedAtAction(nameof(GetById), new { id }, id);
+            _metrics?.ActivityCreated(request.Type);
+            _metrics?.RecordDuration("create_activity", success: true, sw.Elapsed.TotalMilliseconds);
+            return CreatedAtAction(nameof(GetById), new { id }, id);
+        }
+        catch
+        {
+            _metrics?.RecordDuration("create_activity", success: false, sw.Elapsed.TotalMilliseconds);
+            throw;
+        }
+        finally
+        {
+            _metrics?.RequestCompleted();
+        }
     }
 
     /// <summary>
@@ -102,10 +150,25 @@ public class ActivitiesController : ApiControllerBase
             }
         }
 
-        var command = new UpdateActivityCommand(id, request.Text, request.Rating, request.Outcome, expectedVersion);
-        await Sender.Send(command, ct);
+        _metrics?.RequestStarted();
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            var command = new UpdateActivityCommand(id, request.Text, request.Rating, request.Outcome, expectedVersion);
+            await Sender.Send(command, ct);
 
-        return NoContent();
+            _metrics?.RecordDuration("update_activity", success: true, sw.Elapsed.TotalMilliseconds);
+            return NoContent();
+        }
+        catch
+        {
+            _metrics?.RecordDuration("update_activity", success: false, sw.Elapsed.TotalMilliseconds);
+            throw;
+        }
+        finally
+        {
+            _metrics?.RequestCompleted();
+        }
     }
 
     /// <summary>
@@ -117,10 +180,25 @@ public class ActivitiesController : ApiControllerBase
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status404NotFound)]
     public async Task<IActionResult> Delete(string id, CancellationToken ct)
     {
-        var command = new DeleteActivityCommand(id);
-        await Sender.Send(command, ct);
+        _metrics?.RequestStarted();
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            var command = new DeleteActivityCommand(id);
+            await Sender.Send(command, ct);
 
-        return NoContent();
+            _metrics?.RecordDuration("delete_activity", success: true, sw.Elapsed.TotalMilliseconds);
+            return NoContent();
+        }
+        catch
+        {
+            _metrics?.RecordDuration("delete_activity", success: false, sw.Elapsed.TotalMilliseconds);
+            throw;
+        }
+        finally
+        {
+            _metrics?.RequestCompleted();
+        }
     }
 
     /// <summary>
@@ -135,9 +213,24 @@ public class ActivitiesController : ApiControllerBase
         [FromBody] AddCommentRequest request,
         CancellationToken ct)
     {
-        var command = new AddCommentCommand(id, request.Author, request.Text);
-        await Sender.Send(command, ct);
+        _metrics?.RequestStarted();
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            var command = new AddCommentCommand(id, request.Author, request.Text);
+            await Sender.Send(command, ct);
 
-        return NoContent();
+            _metrics?.RecordDuration("add_comment", success: true, sw.Elapsed.TotalMilliseconds);
+            return NoContent();
+        }
+        catch
+        {
+            _metrics?.RecordDuration("add_comment", success: false, sw.Elapsed.TotalMilliseconds);
+            throw;
+        }
+        finally
+        {
+            _metrics?.RequestCompleted();
+        }
     }
 }

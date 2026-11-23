@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Activities.Application.Activities.Commands.DeleteActivity;
 using Activities.Application.Common.Models;
 using Activities.Application.Reviews.Commands.CreateReview;
@@ -5,6 +6,7 @@ using Activities.Application.Reviews.Commands.UpdateReview;
 using Activities.Application.Reviews.Queries.GetReviewById;
 using Activities.Application.Reviews.Queries.GetReviewsList;
 using Activities.WebApi.Contracts;
+using Activities.WebApi.Metrics;
 using AutoMapper;
 using Microsoft.AspNetCore.Mvc;
 
@@ -14,10 +16,12 @@ namespace Activities.WebApi.Controllers;
 public class ReviewsController : ApiControllerBase
 {
     private readonly IMapper _mapper;
+    private readonly ReviewMetrics? _metrics;
 
-    public ReviewsController(IMapper mapper)
+    public ReviewsController(IMapper mapper, ReviewMetrics? metrics = null)
     {
         _mapper = mapper ?? throw new ArgumentNullException(nameof(mapper));
+        _metrics = metrics;
     }
 
     /// <summary>
@@ -32,9 +36,24 @@ public class ReviewsController : ApiControllerBase
         [FromQuery] int pageSize = 20,
         CancellationToken ct = default)
     {
-        var query = new GetReviewsListQuery(productId, page, pageSize);
-        var result = await Sender.Send(query, ct);
-        return Ok(result);
+        _metrics?.RequestStarted();
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            var query = new GetReviewsListQuery(productId, page, pageSize);
+            var result = await Sender.Send(query, ct);
+            _metrics?.RecordDuration("list_reviews", success: true, sw.Elapsed.TotalMilliseconds);
+            return Ok(result);
+        }
+        catch
+        {
+            _metrics?.RecordDuration("list_reviews", success: false, sw.Elapsed.TotalMilliseconds);
+            throw;
+        }
+        finally
+        {
+            _metrics?.RequestCompleted();
+        }
     }
 
     /// <summary>
@@ -46,11 +65,26 @@ public class ReviewsController : ApiControllerBase
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status404NotFound)]
     public async Task<ActionResult<ReviewDto>> GetById(string id, CancellationToken ct)
     {
-        var query = new GetReviewByIdQuery(id);
-        var result = await Sender.Send(query, ct);
+        _metrics?.RequestStarted();
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            var query = new GetReviewByIdQuery(id);
+            var result = await Sender.Send(query, ct);
 
-        Response.Headers.ETag = $"\"{result.Version}\"";
-        return Ok(result);
+            Response.Headers.ETag = $"\"{result.Version}\"";
+            _metrics?.RecordDuration("get_review", success: true, sw.Elapsed.TotalMilliseconds);
+            return Ok(result);
+        }
+        catch
+        {
+            _metrics?.RecordDuration("get_review", success: false, sw.Elapsed.TotalMilliseconds);
+            throw;
+        }
+        finally
+        {
+            _metrics?.RequestCompleted();
+        }
     }
 
     /// <summary>
@@ -64,10 +98,26 @@ public class ReviewsController : ApiControllerBase
         [FromBody] CreateReviewRequest request,
         CancellationToken ct)
     {
-        var command = _mapper.Map<CreateReviewCommand>(request);
-        var id = await Sender.Send(command, ct);
+        _metrics?.RequestStarted();
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            var command = _mapper.Map<CreateReviewCommand>(request);
+            var id = await Sender.Send(command, ct);
 
-        return CreatedAtAction(nameof(GetById), new { id }, id);
+            _metrics?.ReviewCreated(request.Rating);
+            _metrics?.RecordDuration("create_review", success: true, sw.Elapsed.TotalMilliseconds);
+            return CreatedAtAction(nameof(GetById), new { id }, id);
+        }
+        catch
+        {
+            _metrics?.RecordDuration("create_review", success: false, sw.Elapsed.TotalMilliseconds);
+            throw;
+        }
+        finally
+        {
+            _metrics?.RequestCompleted();
+        }
     }
 
     /// <summary>
@@ -95,10 +145,25 @@ public class ReviewsController : ApiControllerBase
             }
         }
 
-        var command = new UpdateReviewCommand(id, request.Text, request.Rating, expectedVersion);
-        await Sender.Send(command, ct);
+        _metrics?.RequestStarted();
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            var command = new UpdateReviewCommand(id, request.Text, request.Rating, expectedVersion);
+            await Sender.Send(command, ct);
 
-        return NoContent();
+            _metrics?.RecordDuration("update_review", success: true, sw.Elapsed.TotalMilliseconds);
+            return NoContent();
+        }
+        catch
+        {
+            _metrics?.RecordDuration("update_review", success: false, sw.Elapsed.TotalMilliseconds);
+            throw;
+        }
+        finally
+        {
+            _metrics?.RequestCompleted();
+        }
     }
 
     /// <summary>
@@ -110,9 +175,24 @@ public class ReviewsController : ApiControllerBase
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status404NotFound)]
     public async Task<IActionResult> Delete(string id, CancellationToken ct)
     {
-        var command = new DeleteActivityCommand(id);
-        await Sender.Send(command, ct);
+        _metrics?.RequestStarted();
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            var command = new DeleteActivityCommand(id);
+            await Sender.Send(command, ct);
 
-        return NoContent();
+            _metrics?.RecordDuration("delete_review", success: true, sw.Elapsed.TotalMilliseconds);
+            return NoContent();
+        }
+        catch
+        {
+            _metrics?.RecordDuration("delete_review", success: false, sw.Elapsed.TotalMilliseconds);
+            throw;
+        }
+        finally
+        {
+            _metrics?.RequestCompleted();
+        }
     }
 }

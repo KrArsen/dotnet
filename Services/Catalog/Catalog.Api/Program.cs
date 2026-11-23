@@ -1,4 +1,5 @@
 using Catalog.Api.Grpc;
+using Catalog.Api.HealthChecks;
 using Catalog.Api.Metrics;
 using Catalog.Api.Middleware;
 using Catalog.Bll.Caching;
@@ -34,11 +35,17 @@ builder.Services.AddDbContext<AppDbContext>(options =>
 builder.Services.AddScoped<IUnitOfWork, UnitOfWork>();
 
 // 5. Дворівневе кешування: L1 (IMemoryCache з обмеженням SizeLimit) + L2 (IDistributedCache поверх Redis через Aspire)
-builder.AddRedisDistributedCache("redis");
+// DisableHealthChecks = true вимикає стандартну Unhealthy-перевірку Aspire, щоб діяла наша Degraded-перевірка redis-cache
+builder.AddRedisDistributedCache("redis", configureSettings: settings => settings.DisableHealthChecks = true);
 builder.Services.AddMemoryCache(o => o.SizeLimit = 10_000);
 builder.Services.AddSingleton<CatalogCacheMetrics>();
 builder.Services.AddSingleton<Catalog.Api.Metrics.CacheMetrics>();
+builder.Services.AddSingleton<CatalogMetrics>();
 builder.Services.AddScoped<ITwoLevelCacheService, TwoLevelCacheService>();
+
+// 5.1. Health Checks для SQL Server (catalog-db), Redis (redis-cache: Degraded) та gRPC Health Checking Protocol
+var redisConnectionString = builder.Configuration.GetConnectionString("redis") ?? "localhost:6379";
+builder.Services.AddCatalogHealthChecks(connectionString, redisConnectionString);
 
 // 6. Реєстрація AutoMapper з підтримкою конфігурації ліцензійного ключа
 builder.Services.AddAutoMapper(cfg =>
@@ -116,6 +123,7 @@ app.MapGet("/", () => Results.Redirect("/swagger"));
 app.MapDefaultEndpoints();
 app.MapControllers();
 app.MapGrpcService<CatalogGrpcService>();
+app.MapGrpcHealthChecksService();
 
 // 11. Автоматичне застосування міграцій та програмний сідінг у scope
 using (var scope = app.Services.CreateScope())

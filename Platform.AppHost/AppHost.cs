@@ -54,35 +54,39 @@ var mongo = builder.AddMongoDB("mongo")
 // База даних ActivitiesDb (Проєкт №3, Лаб. 04 — Clean Architecture + CQRS + MongoDB)
 var activitiesDb = mongo.AddDatabase("ActivitiesDb");
 
-// Контейнер Redis для централізованого розподіленого кешування L2 (Лаб. 06)
+// Контейнер Redis для централізованого розподіленого кешування L2 (Лаб. 06–07)
 var redis = builder.AddRedis("redis")
     .WithDataVolume()
     .WithLifetime(ContainerLifetime.Persistent);
 
 // ============================================================================
-// 2. Реєстрація мікросервісів із прив'язкою до своїх БД та спільного Redis
+// 2. Реєстрація мікросервісів із БД, Redis та HTTP Health Check (/health)
 // ============================================================================
 
 var salesApi = builder.AddProject<Projects.Sales_Api>("sales-api")
     .WithReference(salesDb)
     .WaitFor(salesDb)
     .WithReference(redis)
-    .WaitFor(redis);
+    .WaitFor(redis)
+    .WithHttpHealthCheck("/health");
 
 var catalogApi = builder.AddProject<Projects.Catalog_Api>("catalog-api")
     .WithReference(catalogDb)
     .WaitFor(catalogDb)
     .WithReference(redis)
-    .WaitFor(redis);
+    .WaitFor(redis)
+    .WithHttpHealthCheck("/health");
 
 var activitiesApi = builder.AddProject<Projects.Activities_WebApi>("activities-api")
     .WithReference(activitiesDb)
     .WaitFor(activitiesDb)
     .WithReference(redis)
-    .WaitFor(redis);
+    .WaitFor(redis)
+    .WithHttpHealthCheck("/health");
 
 // ============================================================================
-// 3. Реєстрація Aggregator (gRPC-клієнт + Redis) та ApiGateway (YARP)
+// 3. Реєстрація Aggregator (gRPC-клієнт + Resilience + Redis) та ApiGateway (YARP)
+//    WaitFor тепер очікує статус Healthy від кожного залежного сервісу
 // ============================================================================
 
 var aggregator = builder.AddProject<Projects.Platform_Aggregator>("aggregator")
@@ -97,7 +101,8 @@ var aggregator = builder.AddProject<Projects.Platform_Aggregator>("aggregator")
     .WaitFor(redis)
     .WaitFor(salesApi)
     .WaitFor(catalogApi)
-    .WaitFor(activitiesApi);
+    .WaitFor(activitiesApi)
+    .WithHttpHealthCheck("/health");
 
 builder.AddProject<Projects.Platform_ApiGateway>("gateway")
     .WithHttpEndpoint(port: 5000, name: "public")
@@ -110,6 +115,7 @@ builder.AddProject<Projects.Platform_ApiGateway>("gateway")
     .WaitFor(salesApi)
     .WaitFor(catalogApi)
     .WaitFor(activitiesApi)
-    .WaitFor(aggregator);
+    .WaitFor(aggregator)
+    .WithHttpHealthCheck("/health");
 
 builder.Build().Run();

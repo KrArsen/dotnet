@@ -1,4 +1,6 @@
+using System.Diagnostics;
 using System.Text.Json;
+using Catalog.Api.Metrics;
 using Catalog.Bll.DTOs;
 using Catalog.Bll.Services;
 using FluentValidation;
@@ -16,19 +18,22 @@ public class ProductsController : ControllerBase
     private readonly IValidator<UpdatePriceDto> _updatePriceValidator;
     private readonly IValidator<RemoveStockDto> _removeStockValidator;
     private readonly IValidator<AddStockDto> _addStockValidator;
+    private readonly CatalogMetrics? _metrics;
 
     public ProductsController(
         IProductService productService,
         IValidator<CreateProductDto> createValidator,
         IValidator<UpdatePriceDto> updatePriceValidator,
         IValidator<RemoveStockDto> removeStockValidator,
-        IValidator<AddStockDto> addStockValidator)
+        IValidator<AddStockDto> addStockValidator,
+        CatalogMetrics? metrics = null)
     {
         _productService = productService ?? throw new ArgumentNullException(nameof(productService));
         _createValidator = createValidator ?? throw new ArgumentNullException(nameof(createValidator));
         _updatePriceValidator = updatePriceValidator ?? throw new ArgumentNullException(nameof(updatePriceValidator));
         _removeStockValidator = removeStockValidator ?? throw new ArgumentNullException(nameof(removeStockValidator));
         _addStockValidator = addStockValidator ?? throw new ArgumentNullException(nameof(addStockValidator));
+        _metrics = metrics;
     }
 
     /// <summary>
@@ -49,21 +54,36 @@ public class ProductsController : ControllerBase
             });
         }
 
-        var result = await _productService.GetPagedAsync(query, ct);
-
-        // Додавання метаданих пагінації у заголовок X-Pagination
-        var metadata = new
+        _metrics?.RequestStarted();
+        var sw = Stopwatch.StartNew();
+        try
         {
-            result.TotalCount,
-            result.Page,
-            result.PageSize,
-            result.TotalPages,
-            result.HasNext,
-            result.HasPrevious
-        };
-        Response.Headers["X-Pagination"] = JsonSerializer.Serialize(metadata);
+            var result = await _productService.GetPagedAsync(query, ct);
 
-        return Ok(result);
+            // Додавання метаданих пагінації у заголовок X-Pagination
+            var metadata = new
+            {
+                result.TotalCount,
+                result.Page,
+                result.PageSize,
+                result.TotalPages,
+                result.HasNext,
+                result.HasPrevious
+            };
+            Response.Headers["X-Pagination"] = JsonSerializer.Serialize(metadata);
+
+            _metrics?.RecordDuration("list", success: true, sw.Elapsed.TotalMilliseconds);
+            return Ok(result);
+        }
+        catch
+        {
+            _metrics?.RecordDuration("list", success: false, sw.Elapsed.TotalMilliseconds);
+            throw;
+        }
+        finally
+        {
+            _metrics?.RequestCompleted();
+        }
     }
 
     /// <summary>
@@ -74,8 +94,23 @@ public class ProductsController : ControllerBase
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status404NotFound)]
     public async Task<ActionResult<ProductDto>> GetById(long id, CancellationToken ct)
     {
-        var product = await _productService.GetByIdAsync(id, ct);
-        return Ok(product);
+        _metrics?.RequestStarted();
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            var product = await _productService.GetByIdAsync(id, ct);
+            _metrics?.RecordDuration("get_by_id", success: true, sw.Elapsed.TotalMilliseconds);
+            return Ok(product);
+        }
+        catch
+        {
+            _metrics?.RecordDuration("get_by_id", success: false, sw.Elapsed.TotalMilliseconds);
+            throw;
+        }
+        finally
+        {
+            _metrics?.RequestCompleted();
+        }
     }
 
     /// <summary>
@@ -102,8 +137,24 @@ public class ProductsController : ControllerBase
             });
         }
 
-        var created = await _productService.CreateAsync(dto, user ?? "system", ct);
-        return CreatedAtAction(nameof(GetById), new { id = created.Id }, created);
+        _metrics?.RequestStarted();
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            var created = await _productService.CreateAsync(dto, user ?? "system", ct);
+            _metrics?.ProductCreated(created.ItemType ?? "Service");
+            _metrics?.RecordDuration("create", success: true, sw.Elapsed.TotalMilliseconds);
+            return CreatedAtAction(nameof(GetById), new { id = created.Id }, created);
+        }
+        catch
+        {
+            _metrics?.RecordDuration("create", success: false, sw.Elapsed.TotalMilliseconds);
+            throw;
+        }
+        finally
+        {
+            _metrics?.RequestCompleted();
+        }
     }
 
     /// <summary>
@@ -129,8 +180,24 @@ public class ProductsController : ControllerBase
             });
         }
 
-        await _productService.UpdatePriceAsync(id, dto, user ?? "system", ct);
-        return NoContent();
+        _metrics?.RequestStarted();
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            await _productService.UpdatePriceAsync(id, dto, user ?? "system", ct);
+            _metrics?.ProductUpdated("price");
+            _metrics?.RecordDuration("update_price", success: true, sw.Elapsed.TotalMilliseconds);
+            return NoContent();
+        }
+        catch
+        {
+            _metrics?.RecordDuration("update_price", success: false, sw.Elapsed.TotalMilliseconds);
+            throw;
+        }
+        finally
+        {
+            _metrics?.RequestCompleted();
+        }
     }
 
     /// <summary>
@@ -149,8 +216,24 @@ public class ProductsController : ControllerBase
             return ValidationProblem(new ValidationProblemDetails(validationResult.ToDictionary()));
         }
 
-        await _productService.RemoveStockAsync(id, dto, ct);
-        return NoContent();
+        _metrics?.RequestStarted();
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            await _productService.RemoveStockAsync(id, dto, ct);
+            _metrics?.ProductUpdated("stock_remove");
+            _metrics?.RecordDuration("remove_stock", success: true, sw.Elapsed.TotalMilliseconds);
+            return NoContent();
+        }
+        catch
+        {
+            _metrics?.RecordDuration("remove_stock", success: false, sw.Elapsed.TotalMilliseconds);
+            throw;
+        }
+        finally
+        {
+            _metrics?.RequestCompleted();
+        }
     }
 
     /// <summary>
@@ -168,8 +251,24 @@ public class ProductsController : ControllerBase
             return ValidationProblem(new ValidationProblemDetails(validationResult.ToDictionary()));
         }
 
-        await _productService.AddStockAsync(id, dto, ct);
-        return NoContent();
+        _metrics?.RequestStarted();
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            await _productService.AddStockAsync(id, dto, ct);
+            _metrics?.ProductUpdated("stock_add");
+            _metrics?.RecordDuration("add_stock", success: true, sw.Elapsed.TotalMilliseconds);
+            return NoContent();
+        }
+        catch
+        {
+            _metrics?.RecordDuration("add_stock", success: false, sw.Elapsed.TotalMilliseconds);
+            throw;
+        }
+        finally
+        {
+            _metrics?.RequestCompleted();
+        }
     }
 
     /// <summary>
@@ -183,8 +282,24 @@ public class ProductsController : ControllerBase
         [FromHeader(Name = "X-User")] string? user,
         CancellationToken ct)
     {
-        await _productService.DeleteAsync(id, user ?? "system", ct);
-        return NoContent();
+        _metrics?.RequestStarted();
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            await _productService.DeleteAsync(id, user ?? "system", ct);
+            _metrics?.ProductDeleted();
+            _metrics?.RecordDuration("delete", success: true, sw.Elapsed.TotalMilliseconds);
+            return NoContent();
+        }
+        catch
+        {
+            _metrics?.RecordDuration("delete", success: false, sw.Elapsed.TotalMilliseconds);
+            throw;
+        }
+        finally
+        {
+            _metrics?.RequestCompleted();
+        }
     }
 
     /// <summary>
