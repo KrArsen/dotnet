@@ -54,6 +54,11 @@ public record UpdatePriceDto(
     [property: StringLength(500, ErrorMessage = "Причина зміни ціни не може перевищувати 500 символів.")]
     string? Reason);
 
+public record RenameProductDto(
+    [property: Required(ErrorMessage = "Нова назва позиції каталогу є обов'язковою.")]
+    [property: StringLength(200, MinimumLength = 3, ErrorMessage = "Довжина назви має бути від 3 до 200 символів.")]
+    string NewName);
+
 public record RemoveStockDto(
     [property: Range(1, 1000000, ErrorMessage = "Кількість для списання повинна бути більшою за 0.")]
     int Quantity);

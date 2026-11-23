@@ -124,6 +124,8 @@ public static class Extensions
                     .AddMeter("Reviews.Api")
                     .AddMeter("Activities.WebApi")
                     .AddMeter("Platform.Aggregator")
+                    // Метрики подієвої шини RabbitMQ (публікація, споживання, повтори, DLQ)
+                    .AddMeter("Platform.Messaging")
                     // Метрики дворівневого кешування (L1/L2)
                     .AddMeter(CacheMetrics.MeterName)
                     .AddMeter("Sales.Cache")
@@ -158,6 +160,7 @@ public static class Extensions
                         "Reviews.WebApi",
                         "Platform.Aggregator",
                         "Platform.ApiGateway",
+                        "Platform.Messaging",
                         "Grpc.Net.Client")
                     .AddSource("MongoDB.Driver.Core.Extensions.DiagnosticSources")
                     .AddAspNetCoreInstrumentation(options =>

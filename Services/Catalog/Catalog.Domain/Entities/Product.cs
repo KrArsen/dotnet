@@ -88,6 +88,21 @@ public class Product
         UpdatedBy = changedBy;
     }
 
+    // Інкапсульований метод перейменування позиції каталогу
+    public void Rename(string newName, string updatedBy = "system")
+    {
+        if (string.IsNullOrWhiteSpace(newName))
+            throw new DomainException("Нова назва позиції каталогу не може бути порожньою.");
+
+        var trimmed = newName.Trim();
+        if (trimmed.Length < 3 || trimmed.Length > 200)
+            throw new DomainException("Довжина назви позиції каталогу має становити від 3 до 200 символів.");
+
+        Name = trimmed;
+        UpdatedAt = DateTime.UtcNow;
+        UpdatedBy = updatedBy;
+    }
+
     // Інкапсульований метод списання залишку
     public void RemoveStock(int quantity)
     {

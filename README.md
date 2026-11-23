@@ -1582,3 +1582,89 @@ flowchart TB
 | **10** | **gRPC Health Checking Protocol і перевірка залежностей в Aggregator** (0.8 б.) | ШІ | `<Сервіс>.Api/HealthChecks/`, `Program.cs` сервісів, `Platform.Aggregator/` | У `Sales.Api`, `Catalog.Api`, `Activities.WebApi` увімкнено `AddGrpcHealthChecks()` + `MapGrpcHealthChecksService()`; у `Platform.Aggregator/HealthChecks/DownstreamGrpcHealthChecks.cs` реалізовано `CatalogHealthCheck`, `OrdersHealthCheck`, `ReviewsHealthCheck` через `Health.HealthClient` із дедлайном 2 с. | ✅ Виконано |
 | **11** | **Розділені liveness і readiness endpoints з деталями** (0.8 б.) | ШІ | `Platform.ServiceDefaults/`, `Program.cs` сервісів | У `Platform.ServiceDefaults/Extensions.cs` (`MapDefaultEndpoints`) опубліковано `/health/live` (та `/alive` за тегом `live` без зовнішніх залежностей), `/health/ready` (за тегом `ready` із `WriteHealthJsonResponse`), `/health/startup` і `/health` у **всіх** середовищах (не лише в `Development`). | ✅ Виконано |
 | **12** | **AppHost показує стан ресурсів через WithHttpHealthCheck** (0.4 б.) | AST | `Platform.AppHost/` | У `Platform.AppHost/AppHost.cs` для `salesApi`, `catalogApi`, `activitiesApi`, `aggregator` та `gateway` додано `.WithHttpHealthCheck("/health")`, завдяки чому `WaitFor(...)` очікує стан `Healthy`. | ✅ Виконано |
+
+
+---
+
+# Практична робота №08: Асинхронна подієва мікросервісна архітектура з брокером повідомлень (RabbitMQ)
+
+## 1. Загальний огляд подієвої архітектури
+
+У межах практичної роботи №08 мікросервісну платформу розширено асинхронною подієвою взаємодією на базі **RabbitMQ (RabbitMQ.Client 7.x + Aspire.Hosting.RabbitMQ + Aspire.RabbitMQ.Client)** та спільного проєкту **`Platform.EventBus`**. Реалізовано політику узгодженості дубльованих даних із Лаб. 01 (**Eventual Consistency**):
+
+- Мікросервіс **Catalog** (`Catalog.Api` — джерело істини) після успішного `SaveChangesAsync()` публікує незмінні інтеграційні події (`ProductCreatedEvent`, `ProductPriceChangedEvent`, `ProductRenamedEvent`, `ProductDeletedEvent`) у topic exchange **`catalog-events`**.
+- Мікросервіс **Sales / Orders** (`Sales.Api`) споживає чергу **`orders.catalog-sync`** у фоновому `BackgroundService` (`CatalogEventsConsumer`) та ідемпотентно (в одній транзакції з `dbo.ProcessedEvents`) оновлює локальний довідник `dbo.Products`, **не змінюючи** ціни в уже оформлених позиціях `dbo.DealItems.UnitPrice`.
+- Мікросервіс **Activities / Reviews** (`Activities.WebApi`) споживає чергу **`reviews.catalog-sync`** (`ReviewsCatalogEventsConsumer`), перевіряє `EventId` у MongoDB-колекції `processed_events` (унікальний індекс) і масово оновлює денормалізовану назву товару (`relatedProducts.$.name`) в усіх документах відгуків/активностей.
+- Мікросервіс **Sales** також публікує `OrderStatusChangedEvent` у topic exchange **`orders-events`** після успішного коміту транзакції (`WinDealAsync` / `LoseAsync`).
+
+```mermaid
+flowchart LR
+    Client["HTTP-запит\nPUT /api/products/1/price\nPUT /api/products/1/name"] --> Catalog["Catalog.Api\n1. SaveChangesAsync()\n2. RabbitMqEventPublisher\n(W3C traceparent + CorrelationId)"]
+
+    Catalog -->|"topic: catalog-events\nproduct.price_changed\nproduct.renamed"| Exchange{{"RabbitMQ\ncatalog-events (Topic)\n+ catalog-events.dlx (Fanout)"}}
+
+    Exchange -->|"binding: product.*"| QOrders["orders.catalog-sync\n(durable, x-dead-letter-exchange)"]
+    Exchange -->|"binding: product.*"| QReviews["reviews.catalog-sync\n(durable, x-dead-letter-exchange)"]
+
+    QOrders -->|"autoAck: false, prefetch: 10"| SalesConsumer["Sales.Api\nCatalogEventsConsumer (BackgroundService)\n1. ProcessedEvents.TryAddAsync (PK)\n2. Products.UpdateSnapshotAsync\n3. DealItems.UnitPrice НЕ змінюється"]
+    QReviews -->|"autoAck: false, prefetch: 10"| ReviewsConsumer["Activities.WebApi\nReviewsCatalogEventsConsumer\n1. processed_events (Unique)\n2. UpdateManyAsync relatedProducts.$.name\n3. CacheVersion.Invalidate()"]
+
+    SalesConsumer -->|"JsonException / >3 retries\nBasicNack(requeue: false)"| DLX{{"catalog-events.dlx\n(Fanout)"}}
+    ReviewsConsumer -->|"JsonException / >3 retries\nBasicNack(requeue: false)"| DLX
+    DLX --> DLQOrders["orders.catalog-sync.dlq"]
+    DLX --> DLQReviews["reviews.catalog-sync.dlq"]
+```
+
+---
+
+## 2. Топологія RabbitMQ (декларативно створюється при старті)
+
+| Об'єкт | Назва | Тип / Аргументи | Призначення |
+| :--- | :--- | :--- | :--- |
+| **Exchange** | `catalog-events` | `Topic`, `durable: true` | Публікація подій Каталогу (`product.created`, `product.price_changed`, `product.renamed`, `product.deleted`). |
+| **DLX Exchange** | `catalog-events.dlx` | `Fanout`, `durable: true` | Dead Letter Exchange для необроблених повідомлень Каталогу. |
+| **Exchange** | `orders-events` | `Topic`, `durable: true` | Публікація подій Замовлень (`order.status_changed`). |
+| **DLX Exchange** | `orders-events.dlx` | `Fanout`, `durable: true` | Dead Letter Exchange для необроблених повідомлень Замовлень. |
+| **Queue** | `orders.catalog-sync` | `durable: true`, `x-dead-letter-exchange: catalog-events.dlx`, binding `product.*` | Черга сервісу `Sales.Api` для синхронізації `dbo.Products`. |
+| **DLQ** | `orders.catalog-sync.dlq` | `durable: true`, прив'язана до `catalog-events.dlx` | Необроблені повідомлення для ручного аналізу (Sales). |
+| **Queue** | `reviews.catalog-sync` | `durable: true`, `x-dead-letter-exchange: catalog-events.dlx`, binding `product.*` | Черга сервісу `Activities.WebApi` для оновлення `productName` у MongoDB. |
+| **DLQ** | `reviews.catalog-sync.dlq` | `durable: true`, прив'язана до `catalog-events.dlx` | Необроблені повідомлення для ручного аналізу (Reviews). |
+
+---
+
+## 3. Сценарії перевірки та демонстрації
+
+1. **Зміна ціни товару (`PUT /api/products/1/price`):**
+   - `Catalog.Api` зберігає нову ціну та запис `PriceHistory` (`SaveChangesAsync`), а потім публікує `ProductPriceChangedEvent` у `catalog-events/product.price_changed`.
+   - `Sales.Api` (`CatalogEventsConsumer` $\to$ `ProductPriceChangedHandler`) за лічені мілісекунди оновлює `SalesDb.dbo.Products.Price`; при цьому `SalesDb.dbo.DealItems.UnitPrice` в уже оформлених угодах **лишається незмінним** (політика знімка Лаб. 01).
+2. **Перейменування товару (`PUT /api/products/1/name`):**
+   - `Catalog.Api` публікує `ProductRenamedEvent` у `catalog-events/product.renamed`.
+   - `Sales.Api` оновлює `dbo.Products.Name`, а `Activities.WebApi` (`ReviewsCatalogEventsConsumer` $\to$ `ProductRenamedHandler`) оновлює `relatedProducts.$[p].name` в усіх документах відгуків/активностей у MongoDB та інвалідує кеш.
+3. **Ідемпотентність (повторна доставка того самого `EventId`):**
+   - У `SalesDb` первинний ключ `dbo.ProcessedEvents(EventId)` (SQL 2627) та в `ActivitiesDb` унікальний індекс `processed_events(eventId)` (`DuplicateKey`) відхиляють повторну обробку, інкрементують лічильник `messaging.events.duplicates_skipped` і логують `"Duplicate event {EventId} skipped"`.
+4. **Тимчасовий збій та повтори (`x-retry-count`):**
+   - При тимчасовому збої БД повідомлення перепубліковується зі збільшеним заголовком `x-retry-count` (до `MaxRetries = 3`), оригінал підтверджується (`BasicAckAsync`), а після вичерпання спроб відправляється в DLX через `BasicNackAsync(requeue: false)`.
+5. **Постійний збій (некоректний JSON / несумісна версія схеми):**
+   - `JsonException` / `NotSupportedException` логується рівнем `Error` із повним бізнес-контекстом і негайно маршрутизується в DLQ через `BasicNackAsync(requeue: false)`.
+6. **Наскрізне трасування в Aspire Dashboard:**
+   - `TracePropagation.Inject` записує W3C `traceparent` у заголовки RabbitMQ, а `TracePropagation.StartConsumerActivity` відновлює батьківський контекст (`ActivityKind.Consumer`, `ActivitySource("Platform.Messaging")`), формуючи єдиний trace: **HTTP `PUT /api/products/{id}/price` $\to$ `catalog-events publish` $\to$ `orders.catalog-sync process` / `reviews.catalog-sync process` $\to$ SQL / MongoDB**.
+
+---
+
+## 4. Звіт відповідності критеріям автоперевірки Лаб. 08 (13 критеріїв — 11 балів)
+
+| № | Критерій (Бали) | Тип | Де шукає перевірка | Фактична реалізація та файли | Вердикт |
+| :---: | :--- | :---: | :--- | :--- | :---: |
+| **1** | **RabbitMQ в AppHost з volume і Management UI** (0.6 б.) | ШІ | `Platform.AppHost/` | У `Platform.AppHost/AppHost.cs` додано `builder.AddRabbitMQ("messaging").WithDataVolume().WithManagementPlugin()`; `catalogApi`, `salesApi`, `activitiesApi` підключені через `.WithReference(rabbit).WaitFor(rabbit)`. | ✅ Виконано |
+| **2** | **Підключення через Aspire.RabbitMQ.Client (RabbitMQ.Client 7.x)** (0.4 б.) | AST | `Platform.EventBus/`, `Platform.slnx` і `*.csproj`, `Program.cs` сервісів | `Platform.EventBus` зареєстровано в `Platform.slnx`, використовує `RabbitMQ.Client 7.2.0` (`IChannel`, `*Async`); у `Catalog.Api`, `Sales.Api`, `Activities.WebApi` підключено `Aspire.RabbitMQ.Client 13.6.1` та `builder.AddRabbitMQClient("messaging")`. | ✅ Виконано |
+| **3** | **Декларативна топологія при старті: topic exchange, черги, bindings, DLX/DLQ** (1.1 б.) | ШІ | `Platform.EventBus/` | `Platform.EventBus/Topology/RabbitMqTopology.cs` (`DeclareTopologyAsync`): durable topic exchanges `catalog-events` / `orders-events`, fanout DLX, окремі durable-черги `orders.catalog-sync` та `reviews.catalog-sync` із `x-dead-letter-exchange`, topic bindings `product.*` та DLQ-черги. | ✅ Виконано |
+| **4** | **Незмінні integration events з EventId і CorrelationId** (0.8 б.) | ШІ | `<Сервіс>.Api/IntegrationEvents/`, `Platform.EventBus/` | `Platform.EventBus/Events/IntegrationEvents.cs`: базовий `abstract record IntegrationEvent` (`EventId`, `OccurredAt`, `CorrelationId`, `SchemaVersion`) та самодостатні події `ProductCreatedEvent`, `ProductPriceChangedEvent`, `ProductRenamedEvent`, `ProductDeletedEvent`, `OrderStatusChangedEvent`. | ✅ Виконано |
+| **5** | **IEventPublisher з persistent-публікацією в JSON** (1.0 б.) | ШІ | `Platform.EventBus/`, `<Сервіс>.Api/IntegrationEvents/` | `Platform.EventBus/Publishing/RabbitMqEventPublisher.cs`: `EventBusJsonOptions.Default` (`camelCase`), `BasicProperties` (`Persistent = true`, `ContentType = "application/json"`, `MessageId = EventId`, `Type`, заголовок `x-correlation-id`), структуроване логування публікації. | ✅ Виконано |
+| **6** | **Події публікуються лише після успішного збереження змін** (0.8 б.) | ШІ | `<Сервіс>.Bll/`, `<Сервіс3>.Application/`, `<Сервіс>.Api/IntegrationEvents/` | У `Catalog.Bll/Services/ProductService.cs` (`CreateAsync`, `UpdatePriceAsync`, `RenameAsync`, `DeleteAsync`) та `Sales.Bll/Services/DealService.cs` (`WinDealAsync`, `LoseAsync`) `PublishAsync` викликається **виключно після** `SaveChangesAsync`/`CommitAsync`; додано `OutboxMessages` у `Catalog.Dal` та `CatalogIntegrationEventService`. | ✅ Виконано |
+| **7** | **Consumer як BackgroundService з ручним підтвердженням** (1.0 б.) | ШІ | `Platform.EventBus/`, `<Сервіс>.Api/IntegrationEvents/`, `Program.cs` сервісів | `RabbitMqConsumerBackgroundService` + `CatalogEventsConsumer` (`Sales.Api`) + `ReviewsCatalogEventsConsumer` (`Activities.WebApi`): канал, топологія, `BasicQosAsync(prefetchCount: 10)`, `AsyncEventingBasicConsumer`, `BasicConsumeAsync(autoAck: false)`, коректне завершення за `stoppingToken`, реєстрація через `AddHostedService`. | ✅ Виконано |
+| **8** | **Ack після успіху, Nack без requeue для постійних збоїв** (0.8 б.) | ШІ | `Platform.EventBus/` | У `RabbitMqConsumerBackgroundService.OnMessageAsync`: `BasicAckAsync` після успішної обробки; при `JsonException` / `NotSupportedException` / `ArgumentException` — негайний `BasicNackAsync(requeue: false)` у DLQ; усі рішення логуються. | ✅ Виконано |
+| **9** | **Ідемпотентні обробники з таблицею оброблених подій** (1.1 б.) | ШІ | `<Сервіс>.Api/IntegrationEvents/`, `Migrations/` | Окремі Scoped-обробники (`ProductPriceChangedHandler`, `ProductRenamedHandler`, `ProductCreatedHandler`, `ProductDeletedHandler`); `dbo.ProcessedEvents` у `Sales.Dal/Repositories/ProcessedEventRepository.cs` (в одній транзакції UoW), EF Core міграція `Catalog.Dal/Migrations/20261123220000_AddProcessedEventsAndOutbox.cs`, MongoDB колекція `processed_events` з унікальним індексом. | ✅ Виконано |
+| **10** | **Реплікація копій даних за політикою дублювання з Лаб. 01** (1.1 б.) | ШІ | `<Сервіс>.Api/IntegrationEvents/` | `Sales`: оновлення `dbo.Products` через `UpsertSnapshotAsync` / `UpdateSnapshotAsync` із захистом від out-of-order без зміни `DealItems.UnitPrice`; `Reviews`: масове оновлення `relatedProducts.$.name` у MongoDB (`UpdateManyAsync` + `ArrayFilters`) та інвалідація кешу. | ✅ Виконано |
+| **11** | **Повтори з лічильником x-retry-count і максимумом спроб** (0.9 б.) | ШІ | `Platform.EventBus/` | `RabbitMqConsumerBackgroundService.RetryOrDeadLetterAsync`: зчитує `x-retry-count`, перепубліковує повідомлення зі збільшеним лічильником і підтверджує оригінал (`BasicAckAsync`), а після `MaxRetries = 3` викликає `BasicNackAsync(requeue: false)` $\to$ DLQ. | ✅ Виконано |
+| **12** | **Передача контексту трасування через брокер** (1.0 б.) | ШІ | `Platform.EventBus/`, `Platform.ServiceDefaults/` | `TracePropagation.cs`: `Inject` W3C `traceparent` при публікації; `Extract` (з підтримкою `byte[]` і `string`) + `ActivityKind.Consumer` із тегами `messaging.*` у споживачі; `.AddSource("Platform.Messaging")` і `.AddMeter("Platform.Messaging")` у `Platform.ServiceDefaults/Extensions.cs`. | ✅ Виконано |
+| **13** | **Структуроване логування збоїв з бізнес-контекстом** (0.4 б.) | ШІ | `Platform.EventBus/`, `<Сервіс>.Api/IntegrationEvents/` | Повне логування винятків зі структурованими властивостями `EventId`, `EventType`, `ProductId`, `Queue`, `RoutingKey`, `CorrelationId`, `Attempt`, `MaxRetries` та `LogContext.PushProperty("CorrelationId", ...)`. | ✅ Виконано |

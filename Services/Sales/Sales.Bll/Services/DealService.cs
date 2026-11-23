@@ -2,6 +2,9 @@ using System.Data;
 using System.Diagnostics;
 using AutoMapper;
 using Microsoft.Extensions.Logging;
+using Platform.EventBus.Events;
+using Platform.EventBus.Publishing;
+using Platform.EventBus.Topology;
 using Sales.Bll.Dto;
 using Sales.Bll.Validation;
 using Sales.Dal.Interfaces;
@@ -32,17 +35,20 @@ public class DealService : IDealService
     private readonly IMapper _mapper;
     private readonly IDealValidator _validator;
     private readonly ILogger<DealService>? _logger;
+    private readonly IEventPublisher _eventPublisher;
 
     public DealService(
         IUnitOfWork uow,
         IMapper mapper,
         IDealValidator validator,
-        ILogger<DealService>? logger = null)
+        ILogger<DealService>? logger = null,
+        IEventPublisher? eventPublisher = null)
     {
         _uow = uow ?? throw new ArgumentNullException(nameof(uow));
         _mapper = mapper ?? throw new ArgumentNullException(nameof(mapper));
         _validator = validator ?? throw new ArgumentNullException(nameof(validator));
         _logger = logger;
+        _eventPublisher = eventPublisher ?? NullEventPublisher.Instance;
     }
 
     public async Task<DealDto?> GetByIdAsync(long id, CancellationToken ct = default)
@@ -292,6 +298,24 @@ public class DealService : IDealService
                 "Won",
                 deal.ClientId);
 
+            // 5. Лише після успішного CommitAsync — публікуємо OrderStatusChangedEvent
+            var statusEvent = new OrderStatusChangedEvent(
+                deal.Id,
+                deal.DealNumber,
+                deal.ClientId,
+                deal.Stage,
+                "Won",
+                deal.TotalAmount)
+            {
+                CorrelationId = Activity.Current?.TraceId.ToString()
+            };
+
+            await _eventPublisher.PublishAsync(
+                statusEvent,
+                RabbitMqTopology.OrdersExchange,
+                RabbitMqTopology.OrderStatusChangedRoutingKey,
+                ct);
+
             return true;
         }
         catch (Exception ex)
@@ -329,6 +353,23 @@ public class DealService : IDealService
             dealId,
             "Lost",
             dto.Reason);
+
+        var lostEvent = new OrderStatusChangedEvent(
+            deal.Id,
+            deal.DealNumber,
+            deal.ClientId,
+            deal.Stage,
+            "Lost",
+            deal.TotalAmount)
+        {
+            CorrelationId = Activity.Current?.TraceId.ToString()
+        };
+
+        await _eventPublisher.PublishAsync(
+            lostEvent,
+            RabbitMqTopology.OrdersExchange,
+            RabbitMqTopology.OrderStatusChangedRoutingKey,
+            ct);
 
         return lost;
     }

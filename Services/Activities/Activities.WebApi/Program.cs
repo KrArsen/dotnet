@@ -2,10 +2,12 @@ using Activities.Application;
 using Activities.Application.Common.Mappings;
 using Activities.Infrastructure;
 using Activities.WebApi.HealthChecks;
+using Activities.WebApi.IntegrationEvents;
 using Activities.WebApi.Mapping;
 using Activities.WebApi.Metrics;
 using Activities.WebApi.Middleware;
 using Microsoft.OpenApi.Models;
+using Platform.EventBus.DependencyInjection;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -62,6 +64,14 @@ builder.Services.AddSwaggerGen(options =>
 // 7. Комплексні Health Checks: MongoDB (reviews-db), Redis (redis-cache: Degraded) та gRPC Health Checking Protocol
 var redisConnectionString = builder.Configuration.GetConnectionString("redis") ?? "localhost:6379";
 builder.Services.AddActivitiesHealthChecks(redisConnectionString);
+
+// 8. Брокер повідомлень RabbitMQ через Aspire.RabbitMQ.Client (IConnection + health check) та фоновий consumer
+builder.AddRabbitMQClient("messaging");
+builder.Services.AddRabbitMqEventBus();
+builder.Services.AddScoped<ProductRenamedHandler>();
+builder.Services.AddScoped<ProductPriceChangedHandler>();
+builder.Services.AddScoped<ProductLifecycleHandler>();
+builder.Services.AddHostedService<ReviewsCatalogEventsConsumer>();
 
 var app = builder.Build();
 

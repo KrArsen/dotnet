@@ -20,6 +20,7 @@ public class UnitOfWork : IUnitOfWork
     private IDealRepository? _deals;
     private IProductRepository? _products;
     private ITeamMemberRepository? _teamMembers;
+    private IProcessedEventRepository? _processedEvents;
 
     public UnitOfWork(
         string connectionString,
@@ -55,6 +56,8 @@ public class UnitOfWork : IUnitOfWork
     public IProductRepository Products => _products ??= new ProductRepository(_connection, () => _transaction, _options);
 
     public ITeamMemberRepository TeamMembers => _teamMembers ??= new TeamMemberRepository(_connection, () => _transaction, _options);
+
+    public IProcessedEventRepository ProcessedEvents => _processedEvents ??= new ProcessedEventRepository(_connection, () => _transaction, _options);
 
     public async Task BeginTransactionAsync(
         IsolationLevel isolationLevel = IsolationLevel.ReadCommitted,

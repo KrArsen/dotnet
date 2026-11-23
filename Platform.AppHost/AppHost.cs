@@ -1,7 +1,7 @@
 var builder = DistributedApplication.CreateBuilder(args);
 
 // ============================================================================
-// 1. Контейнери баз даних (SQL Server, MongoDB) та кешу (Redis) з WithDataVolume
+// 1. Контейнери БД (SQL Server, MongoDB), кешу (Redis) та брокера (RabbitMQ) з WithDataVolume
 // ============================================================================
 
 // Пароль SQL Server як параметр-секрет AppHost
@@ -12,7 +12,7 @@ var sql = builder.AddSqlServer("sqlserver", sqlPassword)
     .WithDataVolume()
     .WithLifetime(ContainerLifetime.Persistent);
 
-// Зчитування SQL-скриптів лабораторної №01 (db/p1) для ініціалізації SalesDb
+// Зчитування SQL-скриптів лабораторної №01 (db/p1) для ініціалізації SalesDb (включно з ProcessedEvents)
 var repoRoot = Path.GetFullPath(Path.Combine(builder.AppHostDirectory, ".."));
 var p1Dir = Path.Combine(repoRoot, "db", "p1");
 
@@ -59,8 +59,14 @@ var redis = builder.AddRedis("redis")
     .WithDataVolume()
     .WithLifetime(ContainerLifetime.Persistent);
 
+// Брокер повідомлень RabbitMQ з постійним сховищем та Management UI (порт 15672, Лаб. 08)
+var rabbit = builder.AddRabbitMQ("messaging")
+    .WithDataVolume()
+    .WithManagementPlugin()
+    .WithLifetime(ContainerLifetime.Persistent);
+
 // ============================================================================
-// 2. Реєстрація мікросервісів із БД, Redis та HTTP Health Check (/health)
+// 2. Реєстрація мікросервісів із БД, Redis, RabbitMQ та HTTP Health Check (/health)
 // ============================================================================
 
 var salesApi = builder.AddProject<Projects.Sales_Api>("sales-api")
@@ -68,6 +74,8 @@ var salesApi = builder.AddProject<Projects.Sales_Api>("sales-api")
     .WaitFor(salesDb)
     .WithReference(redis)
     .WaitFor(redis)
+    .WithReference(rabbit)
+    .WaitFor(rabbit)
     .WithHttpHealthCheck("/health");
 
 var catalogApi = builder.AddProject<Projects.Catalog_Api>("catalog-api")
@@ -75,6 +83,8 @@ var catalogApi = builder.AddProject<Projects.Catalog_Api>("catalog-api")
     .WaitFor(catalogDb)
     .WithReference(redis)
     .WaitFor(redis)
+    .WithReference(rabbit)
+    .WaitFor(rabbit)
     .WithHttpHealthCheck("/health");
 
 var activitiesApi = builder.AddProject<Projects.Activities_WebApi>("activities-api")
@@ -82,11 +92,13 @@ var activitiesApi = builder.AddProject<Projects.Activities_WebApi>("activities-a
     .WaitFor(activitiesDb)
     .WithReference(redis)
     .WaitFor(redis)
+    .WithReference(rabbit)
+    .WaitFor(rabbit)
     .WithHttpHealthCheck("/health");
 
 // ============================================================================
 // 3. Реєстрація Aggregator (gRPC-клієнт + Resilience + Redis) та ApiGateway (YARP)
-//    WaitFor тепер очікує статус Healthy від кожного залежного сервісу
+//    WaitFor очікує статус Healthy від кожного залежного сервісу
 // ============================================================================
 
 var aggregator = builder.AddProject<Projects.Platform_Aggregator>("aggregator")

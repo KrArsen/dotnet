@@ -8,6 +8,7 @@ public interface IUnitOfWork : IAsyncDisposable
     IDealRepository Deals { get; }
     IProductRepository Products { get; }
     ITeamMemberRepository TeamMembers { get; }
+    IProcessedEventRepository ProcessedEvents { get; }
 
     Task BeginTransactionAsync(IsolationLevel isolationLevel = IsolationLevel.ReadCommitted, CancellationToken ct = default);
     Task CommitAsync(CancellationToken ct = default);

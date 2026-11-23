@@ -62,7 +62,15 @@ public class IndexCreationService : IHostedService
             };
 
             await collection.Indexes.CreateManyAsync(indexModels, cancellationToken);
-            _logger.LogInformation("MongoDB indexes for 'activities' successfully created/verified.");
+
+            // 7. Унікальний індекс для колекції processed_events (ідемпотентність подій RabbitMQ)
+            await _context.ProcessedEvents.Indexes.CreateOneAsync(
+                new CreateIndexModel<ProcessedEventDocument>(
+                    Builders<ProcessedEventDocument>.IndexKeys.Ascending(x => x.EventId),
+                    new CreateIndexOptions { Name = "idx_processed_events_eventId_unique", Unique = true }),
+                cancellationToken: cancellationToken);
+
+            _logger.LogInformation("MongoDB indexes for 'activities' and 'processed_events' successfully created/verified.");
         }
         catch (Exception ex)
         {

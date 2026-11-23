@@ -32,4 +32,5 @@ public class MongoDbContext
 
     public IMongoCollection<Activity> Activities => _database.GetCollection<Activity>("activities");
     public IMongoCollection<Review> Reviews => _database.GetCollection<Review>("activities");
+    public IMongoCollection<ProcessedEventDocument> ProcessedEvents => _database.GetCollection<ProcessedEventDocument>("processed_events");
 }

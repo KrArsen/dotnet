@@ -6,6 +6,9 @@ using Catalog.Dal.Interfaces;
 using Catalog.Domain.Entities;
 using Catalog.Domain.Exceptions;
 using Microsoft.Extensions.Logging;
+using Platform.EventBus.Events;
+using Platform.EventBus.Publishing;
+using Platform.EventBus.Topology;
 
 namespace Catalog.Bll.Services;
 
@@ -16,12 +19,18 @@ public class ProductService : IProductService
     private readonly IUnitOfWork _uow;
     private readonly IMapper _mapper;
     private readonly ILogger<ProductService> _logger;
+    private readonly IEventPublisher _eventPublisher;
 
-    public ProductService(IUnitOfWork uow, IMapper mapper, ILogger<ProductService> logger)
+    public ProductService(
+        IUnitOfWork uow,
+        IMapper mapper,
+        ILogger<ProductService> logger,
+        IEventPublisher? eventPublisher = null)
     {
         _uow = uow ?? throw new ArgumentNullException(nameof(uow));
         _mapper = mapper ?? throw new ArgumentNullException(nameof(mapper));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _eventPublisher = eventPublisher ?? NullEventPublisher.Instance;
     }
 
     public async Task<PagedResult<ProductDto>> GetPagedAsync(ProductQuery query, CancellationToken ct = default)
@@ -30,16 +39,13 @@ public class ProductService : IProductService
         activity?.SetTag("catalog.page", query.Page);
         activity?.SetTag("catalog.pageSize", query.PageSize);
 
-        // Нормалізація пагінації
         var page = query.Page < 1 ? 1 : query.Page;
         var pageSize = Math.Clamp(query.PageSize, 1, 100);
         var normalizedQuery = query with { Page = page, PageSize = pageSize };
 
-        // 1. Окремий CountAsync за специфікацією для точного підрахунку всіх записів у БД (без Skip/Take)
         var countSpec = new ProductsFilterCountSpec(normalizedQuery);
         var totalCount = await _uow.Products.CountAsync(countSpec, ct);
 
-        // 2. Отримання сторінки записів через SQL з фільтрацією, сортуванням та Skip/Take
         var filterSpec = new ProductsFilterSpec(normalizedQuery);
         var products = await _uow.Products.ListAsync(filterSpec, ct);
 
@@ -69,14 +75,12 @@ public class ProductService : IProductService
         activity?.SetTag("product.sku", dto.Sku);
         activity?.SetTag("product.itemType", dto.ItemType);
 
-        // Перевірка унікальності SKU (бізнес-правило BLL)
         var skuExists = await _uow.Products.ExistsBySkuAsync(dto.Sku, ct);
         if (skuExists)
         {
             throw new ConflictException($"Позиція з артикулом (SKU) '{dto.Sku}' вже існує в каталозі.");
         }
 
-        // Створення агрегату Product із захищеними інваріантами
         var product = new Product(
             dto.Sku,
             dto.Name,
@@ -111,6 +115,7 @@ public class ProductService : IProductService
         }
 
         await _uow.Products.AddAsync(product, ct);
+        // 1) Спершу фіксуємо зміни у БД; якщо SaveChangesAsync впаде — подія не публікується
         await _uow.SaveChangesAsync(ct);
 
         activity?.SetTag("product.id", product.Id);
@@ -122,6 +127,23 @@ public class ProductService : IProductService
             product.Price,
             product.StockQuantity,
             product.IsActive ? "Active" : "Inactive");
+
+        // 2) Лише після успішного збереження в БД публікуємо ProductCreatedEvent у RabbitMQ
+        var createdEvent = new ProductCreatedEvent(
+            product.Id,
+            product.Sku,
+            product.Name,
+            product.Price,
+            product.IsActive)
+        {
+            CorrelationId = Activity.Current?.TraceId.ToString()
+        };
+
+        await _eventPublisher.PublishAsync(
+            createdEvent,
+            RabbitMqTopology.CatalogExchange,
+            RabbitMqTopology.ProductCreatedRoutingKey,
+            ct);
 
         return _mapper.Map<ProductDto>(product);
     }
@@ -142,10 +164,10 @@ public class ProductService : IProductService
 
         var oldPrice = product.Price;
 
-        // Інкапсульоване доменне правило зміни ціни (перевіряє > 0 та фіксує PriceHistory)
         product.ChangePrice(dto.NewPrice, updatedBy, dto.Reason);
 
         _uow.Products.Update(product);
+        // 1) Збереження змін у БД
         await _uow.SaveChangesAsync(ct);
 
         _logger.LogInformation(
@@ -154,6 +176,65 @@ public class ProductService : IProductService
             oldPrice,
             dto.NewPrice,
             product.IsActive ? "Active" : "Inactive");
+
+        // 2) Лише після SaveChangesAsync — публікація ProductPriceChangedEvent (синхронізація Products у Sales)
+        var priceChangedEvent = new ProductPriceChangedEvent(
+            product.Id,
+            product.Name,
+            oldPrice,
+            dto.NewPrice)
+        {
+            CorrelationId = Activity.Current?.TraceId.ToString()
+        };
+
+        await _eventPublisher.PublishAsync(
+            priceChangedEvent,
+            RabbitMqTopology.CatalogExchange,
+            RabbitMqTopology.ProductPriceChangedRoutingKey,
+            ct);
+    }
+
+    public async Task RenameAsync(long id, RenameProductDto dto, string updatedBy = "system", CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(dto);
+
+        using var activity = Source.StartActivity("RenameProduct");
+        activity?.SetTag("product.id", id);
+
+        var product = await _uow.Products.GetByIdAsync(id, ct);
+        if (product == null || product.IsDeleted)
+        {
+            throw new EntityNotFoundException(nameof(Product), id);
+        }
+
+        var oldName = product.Name;
+        product.Rename(dto.NewName, updatedBy);
+
+        _uow.Products.Update(product);
+        // 1) Спершу фіксація в БД
+        await _uow.SaveChangesAsync(ct);
+
+        _logger.LogInformation(
+            "Product {ProductId} renamed from '{OldName}' to '{NewName}'",
+            id,
+            oldName,
+            product.Name);
+
+        // 2) Лише після SaveChangesAsync — публікація ProductRenamedEvent (оновлює Products у Sales та productName у Reviews)
+        var renamedEvent = new ProductRenamedEvent(
+            product.Id,
+            oldName,
+            product.Name,
+            product.Price)
+        {
+            CorrelationId = Activity.Current?.TraceId.ToString()
+        };
+
+        await _eventPublisher.PublishAsync(
+            renamedEvent,
+            RabbitMqTopology.CatalogExchange,
+            RabbitMqTopology.ProductRenamedRoutingKey,
+            ct);
     }
 
     public async Task RemoveStockAsync(long id, RemoveStockDto dto, CancellationToken ct = default)
@@ -170,7 +251,6 @@ public class ProductService : IProductService
             throw new EntityNotFoundException(nameof(Product), id);
         }
 
-        // Інкапсульоване доменне правило (перевіряє залишок, кидає DomainException)
         product.RemoveStock(dto.Quantity);
 
         _uow.Products.Update(product);
@@ -222,17 +302,30 @@ public class ProductService : IProductService
             throw new EntityNotFoundException(nameof(Product), id);
         }
 
+        var productName = product.Name;
         product.MarkDeleted(deletedBy);
 
         _uow.Products.Update(product);
+        // 1) Збереження м'якого видалення в БД
         await _uow.SaveChangesAsync(ct);
 
         _logger.LogInformation("Product {ProductId} soft deleted, Status {Status}", id, "Deleted");
+
+        // 2) Публікація ProductDeletedEvent після успішного SaveChangesAsync
+        var deletedEvent = new ProductDeletedEvent(product.Id, productName)
+        {
+            CorrelationId = Activity.Current?.TraceId.ToString()
+        };
+
+        await _eventPublisher.PublishAsync(
+            deletedEvent,
+            RabbitMqTopology.CatalogExchange,
+            RabbitMqTopology.ProductDeletedRoutingKey,
+            ct);
     }
 
     public async Task<IReadOnlyList<ProductDto>> GetByCategoryAsync(long categoryId, CancellationToken ct = default)
     {
-        // Застосування альтернативної специфікації ProductsByCategorySpec через загальний метод репозиторію
         var spec = new ProductsByCategorySpec(categoryId);
         var products = await _uow.Products.ListAsync(spec, ct);
         return _mapper.Map<IReadOnlyList<ProductDto>>(products);

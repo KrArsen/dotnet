@@ -201,6 +201,39 @@ public class ProductsController : ControllerBase
     }
 
     /// <summary>
+    /// Перейменувати позицію каталогу та опублікувати подію ProductRenamedEvent (оновлює Sales та Reviews)
+    /// </summary>
+    [HttpPut("{id:long}/name")]
+    [ProducesResponseType(StatusCodes.Status204NoContent)]
+    [ProducesResponseType(typeof(ValidationProblemDetails), StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status404NotFound)]
+    public async Task<IActionResult> Rename(
+        long id,
+        [FromBody] RenameProductDto dto,
+        [FromHeader(Name = "X-User")] string? user,
+        CancellationToken ct)
+    {
+        _metrics?.RequestStarted();
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            await _productService.RenameAsync(id, dto, user ?? "system", ct);
+            _metrics?.ProductUpdated("name");
+            _metrics?.RecordDuration("rename", success: true, sw.Elapsed.TotalMilliseconds);
+            return NoContent();
+        }
+        catch
+        {
+            _metrics?.RecordDuration("rename", success: false, sw.Elapsed.TotalMilliseconds);
+            throw;
+        }
+        finally
+        {
+            _metrics?.RequestCompleted();
+        }
+    }
+
+    /// <summary>
     /// Списати залишок товару на складі
     /// </summary>
     [HttpPost("{id:long}/stock/remove")]

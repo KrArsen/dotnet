@@ -104,6 +104,12 @@ public class CachedProductService : IProductService
         await InvalidateAfterWriteAsync(id, null, "ProductPriceUpdated", ct);
     }
 
+    public async Task RenameAsync(long id, RenameProductDto dto, string updatedBy = "system", CancellationToken ct = default)
+    {
+        await _inner.RenameAsync(id, dto, updatedBy, ct);
+        await InvalidateAfterWriteAsync(id, null, "ProductRenamed", ct);
+    }
+
     public async Task RemoveStockAsync(long id, RemoveStockDto dto, CancellationToken ct = default)
     {
         await _inner.RemoveStockAsync(id, dto, ct);

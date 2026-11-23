@@ -34,10 +34,11 @@ public static class DependencyInjection
         // 3. Singleton контекст доступу до MongoDB
         services.AddSingleton<MongoDbContext>();
 
-        // 4. Репозиторії (Scoped)
+        // 4. Репозиторії та реплікація інтеграційних подій (Scoped)
         services.AddScoped<ActivityRepository>();
         services.AddScoped<IActivityRepository>(sp => sp.GetRequiredService<ActivityRepository>());
         services.AddScoped<IReviewRepository>(sp => sp.GetRequiredService<ActivityRepository>());
+        services.AddScoped<IProductReplicationStore, MongoProductReplicationStore>();
 
         // 5. Оптимізовані CQRS Queries (Scoped)
         services.AddScoped<ActivityQueries>();

@@ -1,5 +1,6 @@
 using Catalog.Api.Grpc;
 using Catalog.Api.HealthChecks;
+using Catalog.Api.IntegrationEvents;
 using Catalog.Api.Metrics;
 using Catalog.Api.Middleware;
 using Catalog.Bll.Caching;
@@ -12,6 +13,7 @@ using Catalog.Dal.UnitOfWork;
 using FluentValidation;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.OpenApi.Models;
+using Platform.EventBus.DependencyInjection;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -46,6 +48,11 @@ builder.Services.AddScoped<ITwoLevelCacheService, TwoLevelCacheService>();
 // 5.1. Health Checks для SQL Server (catalog-db), Redis (redis-cache: Degraded) та gRPC Health Checking Protocol
 var redisConnectionString = builder.Configuration.GetConnectionString("redis") ?? "localhost:6379";
 builder.Services.AddCatalogHealthChecks(connectionString, redisConnectionString);
+
+// 5.2. Брокер повідомлень RabbitMQ через Aspire.RabbitMQ.Client (IConnection + health check) та EventBus publisher
+builder.AddRabbitMQClient("messaging");
+builder.Services.AddRabbitMqEventBus();
+builder.Services.AddScoped<ICatalogIntegrationEventService, CatalogIntegrationEventService>();
 
 // 6. Реєстрація AutoMapper з підтримкою конфігурації ліцензійного ключа
 builder.Services.AddAutoMapper(cfg =>

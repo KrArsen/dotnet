@@ -1,6 +1,8 @@
 using Microsoft.Extensions.Options;
 using Microsoft.OpenApi.Models;
+using Platform.EventBus.DependencyInjection;
 using Sales.Api.HealthChecks;
+using Sales.Api.IntegrationEvents;
 using Sales.Api.Metrics;
 using Sales.Api.Middleware;
 using Sales.Bll.Caching;
@@ -78,6 +80,15 @@ builder.Services.AddScoped<SalesTwoLevelCacheService>();
 // Health Checks для SQL Server (orders-db), Redis (redis-cache: Degraded) та gRPC Health Checking Protocol
 var redisConnectionString = builder.Configuration.GetConnectionString("redis") ?? "localhost:6379";
 builder.Services.AddSalesHealthChecks(connectionString, redisConnectionString);
+
+// Брокер повідомлень RabbitMQ через Aspire.RabbitMQ.Client (IConnection + health check), publisher та фоновий consumer
+builder.AddRabbitMQClient("messaging");
+builder.Services.AddRabbitMqEventBus();
+builder.Services.AddScoped<ProductPriceChangedHandler>();
+builder.Services.AddScoped<ProductRenamedHandler>();
+builder.Services.AddScoped<ProductCreatedHandler>();
+builder.Services.AddScoped<ProductDeletedHandler>();
+builder.Services.AddHostedService<CatalogEventsConsumer>();
 
 // Явна реєстрація валідаторів рівня 2 (Scoped)
 builder.Services.AddScoped<IClientValidator, ClientValidator>();
