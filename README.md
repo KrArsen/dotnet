@@ -1668,3 +1668,173 @@ flowchart LR
 | **11** | **Повтори з лічильником x-retry-count і максимумом спроб** (0.9 б.) | ШІ | `Platform.EventBus/` | `RabbitMqConsumerBackgroundService.RetryOrDeadLetterAsync`: зчитує `x-retry-count`, перепубліковує повідомлення зі збільшеним лічильником і підтверджує оригінал (`BasicAckAsync`), а після `MaxRetries = 3` викликає `BasicNackAsync(requeue: false)` $\to$ DLQ. | ✅ Виконано |
 | **12** | **Передача контексту трасування через брокер** (1.0 б.) | ШІ | `Platform.EventBus/`, `Platform.ServiceDefaults/` | `TracePropagation.cs`: `Inject` W3C `traceparent` при публікації; `Extract` (з підтримкою `byte[]` і `string`) + `ActivityKind.Consumer` із тегами `messaging.*` у споживачі; `.AddSource("Platform.Messaging")` і `.AddMeter("Platform.Messaging")` у `Platform.ServiceDefaults/Extensions.cs`. | ✅ Виконано |
 | **13** | **Структуроване логування збоїв з бізнес-контекстом** (0.4 б.) | ШІ | `Platform.EventBus/`, `<Сервіс>.Api/IntegrationEvents/` | Повне логування винятків зі структурованими властивостями `EventId`, `EventType`, `ProductId`, `Queue`, `RoutingKey`, `CorrelationId`, `Attempt`, `MaxRetries` та `LogContext.PushProperty("CorrelationId", ...)`. | ✅ Виконано |
+
+
+---
+
+# Практична робота №09: Аутентифікація та авторизація в мікросервісній архітектурі
+
+## 1. Архітектура безпеки (три підходи у прогресії)
+
+Мікросервісну платформу захищено трьома взаємодоповнюючими підходами аутентифікації та авторизації з єдиною точкою входу через **API Gateway (YARP, порт `5000`)**:
+
+```mermaid
+flowchart LR
+    Client["Client / Postman / Swagger UI"] --> GW["Platform.ApiGateway (YARP :5000)\nMulti-Provider JWT + X-User-Id"]
+    GW -->|"/auth/** (anonymous)\n/users/** (authenticated)"| Auth["Services/Auth/Auth.Api\nASP.NET Identity + JWT\n(IdentityDb)"]
+    GW -->|"/orders/** (authenticated)"| Sales["Sales.Api (Orders)\n[RequirePermission]"]
+    GW -->|"/products/** (authenticated)"| Catalog["Catalog.Api (Products)\n[RequirePermission]"]
+    GW -->|"/payments/** (authenticated)"| Payments["Payments.Api (Admin Only)\n[RequirePermission]"]
+    GW -->|"/api/aggregator/**"| Agg["Platform.Aggregator\nOAuth2 Client Credentials"]
+
+    Client -.->|"OAuth 2.0 / OIDC"| IDP["Platform.IdentityServer (:5005)\nDuende IdentityServer\n(IdentityServerDb)"]
+    Agg -->|"POST /connect/token\n(aggregator_service)"| IDP
+    Client -.->|"OIDC / UMA RPT"| KC["Keycloak (:8080)\nRealm: DevRealmDrivers"]
+    Pulumi["infra/keycloak/ (Pulumi C# IaC)"] -->|"pulumi up"| KC
+```
+
+### Компоненти рішення Лаб. 09:
+1. **Частина 1 — ASP.NET Identity + JWT (`Services/Auth/Auth.Api/`)**:
+   - Окрема база `IdentityDb` у `Platform.AppHost/AppHost.cs` + EF Core міграція `Services/Auth/Auth.Api/Migrations/20261123223000_InitialIdentity.cs`.
+   - `ApplicationUser` та `RefreshToken` (`CreatedAtUtc`, `ExpiresAtUtc`, `RevokedAtUtc`, `ReplacedByToken`, `RevokedReason`).
+   - Політика паролів (`RequiredLength = 8`, digit, upper, lower, non-alphanumeric), `RequireUniqueEmail = true`, `RequireConfirmedEmail = true`, `Lockout` (5 спроб $\to$ блокування на 15 хв).
+   - `JwtTokenService`: Access Token (`15 хв`, claims `sub`, `unique_name`, `email`, `role`) + Refresh Token (`7 днів`, `HttpOnly` cookie, ротація з відкликанням попереднього токена та виявленням повторного використання).
+   - Усі ендпоінти `/auth/*` (`register`, `login`, `refresh-token`, `revoke-token`, `logout`, `verify-email`, `resend-verification`, `forgot-password`, `reset-password`, `change-password`) та `/users/*` (`Admin`-only та owner-check за `userId` з JWT).
+2. **Частина 2 — Duende IdentityServer (`Platform.IdentityServer/`)**:
+   - Ізольований контейнер `identityserver-sql` із базою `IdentityServerDb` (порт `:5005`).
+   - `AddIdentityServer().AddAspNetIdentity<ApplicationUser>().AddConfigurationStore().AddOperationalStore()` + міграції для всіх трьох контекстів (`ApplicationDbContext`, `ConfigurationDbContext`, `PersistedGrantDbContext`) + Quickstart UI (`/Account/Login`, `/Account/Logout`).
+   - `IdentityResources`, `ApiScopes`, `ApiResources` та три клієнти у `Config.cs`:
+     - `postman` — Authorization Code Flow + `AllowOfflineAccess = true`;
+     - `aggregator_service` — Client Credentials Flow (M2M без `sub`);
+     - `swagger` — Public Client із `RequirePkce = true`, `RequireClientSecret = false`.
+   - `Platform.Aggregator/Auth/ClientCredentialsTokenHandler.cs` автоматично запитує M2M токен через `/connect/token` (або форвардить вхідний Bearer-токен користувача).
+3. **Частина 3 — Keycloak + Pulumi IaC (`Platform.AppHost/` · `infra/keycloak/` · `Services/Payments/Payments.Api/`)**:
+   - **Траєкторія Б (.NET Aspire):** `builder.AddKeycloak("keycloak", 8080).WithDataVolume()` (`Aspire.Hosting.Keycloak`) та `AddKeycloakJwtBearer(serviceName: "keycloak", realm: "DevRealmDrivers", ...)` (`Aspire.Keycloak.Authentication`) у `Program.cs` усіх мікросервісів та Gateway.
+   - **Pulumi C# проєкт (`infra/keycloak/`):** `KeycloakStack`, `KeycloakClientFactory` (Factory Pattern), `KeycloakClientExtensions` (`AddAudienceMapper`, `AddPermissionsMapper`, `AttachDefaultScopes`), Realm `DevRealmDrivers`, 3 Resource Servers (`orders-api`, `products-api`, `payments-api`), повний набір scopes, ролі (`admin`, `manager`, `user`, `guest`), role policies & scope permissions, 3 клієнти (`orders.postman`, `orders.swagger`, `orders.bff`), 4 тестові користувачі (`alice.admin`, `john.manager`, `bob.user`, `guest.viewer`) та outputs (`RealmUrl`, `AdminConsoleUrl`, `ClientIds`, `ClientSecrets`).
+   - **Локальна перевірка `[RequirePermission("...")]`:** `PermissionRequirement` та `PermissionAuthorizationHandler` у `Platform.ServiceDefaults/Authorization/PermissionAuthorization.cs` парсять `authorization.permissions[].scopes[]` без мережевих викликів до Keycloak на кожен запит.
+
+---
+
+## 2. Матриця доступу (Ролі $\times$ Ендпоінти)
+
+### Orders Service (`Sales.Api` — Resource Server `orders-api`)
+| Ендпоінт | `[RequirePermission]` | `admin` (`alice.admin`) | `manager` (`john.manager`) | `user` (`bob.user`) | `guest` (`guest.viewer`) |
+| :--- | :--- | :---: | :---: | :---: | :---: |
+| `GET /orders` | `orders:read` | **200 OK** | **200 OK** | **200 OK** | **403 Forbidden** |
+| `GET /orders/{id}` | `orders:read` | **200 OK** | **200 OK** | **200 OK** | **403 Forbidden** |
+| `POST /orders` | `orders:create` | **201 Created** | **403 Forbidden** | **201 Created** | **403 Forbidden** |
+| `PUT /orders/{id}` | `orders:update` | **200 OK** | **200 OK** | **403 Forbidden** | **403 Forbidden** |
+| `DELETE /orders/{id}` | `orders:delete` | **204 No Content** | **403 Forbidden** | **403 Forbidden** | **403 Forbidden** |
+| `POST /orders/{id}/approve` | `orders:approve` | **204 No Content** | **204 No Content** | **403 Forbidden** | **403 Forbidden** |
+
+### Products Service (`Catalog.Api` — Resource Server `products-api`)
+| Ендпоінт | `[RequirePermission]` | `admin` (`alice.admin`) | `manager` (`john.manager`) | `user` (`bob.user`) | `guest` (`guest.viewer`) |
+| :--- | :--- | :---: | :---: | :---: | :---: |
+| `GET /products` | `products:read` | **200 OK** | **200 OK** | **200 OK** | **200 OK** |
+| `GET /products/{id}` | `products:read` | **200 OK** | **200 OK** | **200 OK** | **200 OK** |
+| `POST /products` | `products:create` | **201 Created** | **403 Forbidden** | **403 Forbidden** | **403 Forbidden** |
+| `PUT /products/{id}` | `products:update` | **200 OK** | **200 OK** | **403 Forbidden** | **403 Forbidden** |
+| `DELETE /products/{id}` | `products:delete` | **204 No Content** | **403 Forbidden** | **403 Forbidden** | **403 Forbidden** |
+| `POST /products/{id}/publish` | `products:publish` | **200 OK** | **200 OK** | **403 Forbidden** | **403 Forbidden** |
+
+### Payments Service (`Payments.Api` — Resource Server `payments-api`, виключно `admin`)
+| Ендпоінт | `[RequirePermission]` | `admin` (`alice.admin`) | `manager` (`john.manager`) | `user` (`bob.user`) | `guest` (`guest.viewer`) |
+| :--- | :--- | :---: | :---: | :---: | :---: |
+| `GET /payments` | `payments:read` | **200 OK** | **403 Forbidden** | **403 Forbidden** | **403 Forbidden** |
+| `POST /payments/process` | `payments:process` | **201 Created** | **403 Forbidden** | **403 Forbidden** | **403 Forbidden** |
+| `POST /payments/refund` | `payments:refund` | **200 OK** | **403 Forbidden** | **403 Forbidden** | **403 Forbidden** |
+
+---
+
+## 3. Приклади декодованих JWT-токенів (jwt.io)
+
+### 3.1. ASP.NET Identity Access Token (15 хв)
+```json
+{
+  "sub": "c8b2f10a-5e34-4a2b-8b1e-1d2e3f4a5b6c",
+  "unique_name": "admin",
+  "email": "admin@studio.ua",
+  "jti": "7a9c4b1e-22d1-4a76-a09f-001122334455",
+  "role": ["Admin", "User"],
+  "iss": "Platform.Auth.Api",
+  "aud": "Platform.Microservices",
+  "exp": 1795470000
+}
+```
+
+### 3.2. Duende IdentityServer Client Credentials Token (`aggregator_service`, без `sub`)
+```json
+{
+  "iss": "http://localhost:5005",
+  "aud": ["orders_api", "products_api", "http://localhost:5005/resources"],
+  "client_id": "aggregator_service",
+  "scope": ["orders_api", "orders.read", "products_api", "products.read"],
+  "exp": 1795473600
+}
+```
+
+### 3.3. Keycloak UMA RPT Token (`john.manager` — без прав на `payments-api` та `*:delete`)
+```json
+{
+  "iss": "http://localhost:8080/realms/DevRealmDrivers",
+  "sub": "8d1f2a90-334c-4c8d-9111-abcdef012345",
+  "preferred_username": "john.manager",
+  "aud": ["orders-api", "products-api"],
+  "realm_access": {
+    "roles": ["manager"]
+  },
+  "authorization": {
+    "permissions": [
+      {
+        "rsname": "orders-resource",
+        "scopes": ["orders:read", "orders:update", "orders:approve"]
+      },
+      {
+        "rsname": "products-resource",
+        "scopes": ["products:read", "products:update", "products:publish"]
+      }
+    ]
+  }
+}
+```
+
+---
+
+## 4. Запуск Pulumi IaC та Postman-колекція
+
+```bash
+# 1. Запуск платформи з Keycloak (:8080), IdentityServer (:5005), Auth Service та Gateway (:5000)
+dotnet run --project Platform.AppHost
+
+# 2. Розгортання Realm DevRealmDrivers, клієнтів, ролей і permissions через Pulumi
+cd infra/keycloak
+pulumi stack select dev --create
+pulumi preview
+pulumi up --yes
+pulumi stack output
+
+# 3. Очищення Keycloak-ресурсів
+pulumi destroy --yes
+```
+
+Готова колекція Postman з усіма сценаріями частин 1–3: [`docs/lab09-postman-collection.json`](docs/lab09-postman-collection.json).
+
+---
+
+## 5. Звіт відповідності критеріям автоперевірки Лаб. 09 (13 критеріїв — 13 балів)
+
+| № | Критерій (Бали) | Тип | Де шукає перевірка | Фактична реалізація та файли | Вердикт |
+| :---: | :--- | :---: | :--- | :--- | :---: |
+| **1** | **Auth Service на ASP.NET Identity з окремою базою через Aspire** (0.8 б.) | ШІ | `Services/Auth/Auth.Api/`, `Platform.AppHost/` | `IdentityDb` у `Platform.AppHost/AppHost.cs`; `ApplicationUser`, `ApplicationDbContext : IdentityDbContext<ApplicationUser>`, `AddIdentity` із вимогами пароля та lockout (5 спроб / 15 хв); міграція `Services/Auth/Auth.Api/Migrations/20261123223000_InitialIdentity.cs`. | ✅ Виконано |
+| **2** | **JWT-сервіс: access 15 хв і refresh 7 днів з ротацією** (1.4 б.) | ШІ | `Services/Auth/Auth.Api/` | `JwtTokenService.cs`: access 15 хв із claims `sub`, `unique_name`, `role`; `RefreshToken` у БД з `CreatedAtUtc`, `ExpiresAtUtc`, `RevokedAtUtc`, `ReplacedByToken`; ротація відкликає старий токен і віддає новий у `HttpOnly` cookie, а access — у JSON body. | ✅ Виконано |
+| **3** | **Ендпоінти register / login / refresh-token / revoke-token / logout** (1.1 б.) | ШІ | `Services/Auth/Auth.Api/` | `AuthController.cs`: `POST /auth/register` (призначає роль `User`), `POST /auth/login`, `POST /auth/refresh-token`, `POST /auth/revoke-token`, `POST /auth/logout` (відкликають токен у БД та очищують cookie). | ✅ Виконано |
+| **4** | **Підтвердження email, відновлення та зміна пароля** (1.0 б.) | ШІ | `Services/Auth/Auth.Api/` | `verify-email`, `resend-verification` (`EmailConfirmed == false` блокує логін з 403), `forgot-password`, `reset-password` (одноразовий токен + відкликання всіх активних refresh-токенів), `change-password` (`[Authorize]`), `MockEmailService.cs`. | ✅ Виконано |
+| **5** | **Ролі User / Admin та захищені ендпоінти /users** (0.8 б.) | ШІ | `Services/Auth/Auth.Api/` | `IdentityDataSeeder.cs` створює ролі `User` і `Admin` при старті; `UsersController.cs`: `[Authorize(Roles = "Admin")]` на адмін-методах, перевірка `userId == id || IsInRole("Admin")` на owner-методах. | ✅ Виконано |
+| **6** | **Gateway маршрутизує /auth і /users, мікросервіси валідують JWT** (0.8 б.) | ШІ | `Platform.ApiGateway/`, `Program.cs` сервісів | YARP маршрути `/auth/{**catch-all}`, `/users/{**catch-all}`, `/payments/{**catch-all}`, `/orders/{**catch-all}`, `/products/{**catch-all}` у `Platform.ApiGateway/appsettings.json`; валідація JWT + `X-User-Id` у `Platform.ApiGateway/Program.cs`; `AddJwtBearer`, `[Authorize]` і використання claims (`ResolveActor`) у мікросервісах. | ✅ Виконано |
+| **7** | **IdentityServer з окремою базою, ASP.NET Identity і EF-сховищами** (1.1 б.) | ШІ | `Platform.IdentityServer/`, `Platform.AppHost/` | `identityserver-sql` / `IdentityServerDb` у `AppHost.cs`; `AddIdentityServer().AddAspNetIdentity<ApplicationUser>().AddConfigurationStore().AddOperationalStore()`; міграції всіх трьох контекстів (`ApplicationDb`, `ConfigurationDb`, `PersistedGrantDb`); Quickstart UI (`AccountController`, `Login.cshtml`, `LoggedOut.cshtml`). | ✅ Виконано |
+| **8** | **ApiResources, ApiScopes і три clients** (1.0 б.) | ШІ | `Platform.IdentityServer/` | `Platform.IdentityServer/Config.cs`: `ApiResources`, `ApiScopes` і 3 клієнти — `postman` (Authorization Code + `AllowOfflineAccess`), `aggregator_service` (Client Credentials), `swagger` (public client `RequirePkce = true`, `RequireClientSecret = false`). | ✅ Виконано |
+| **9** | **Мікросервіси приймають токени IdentityServer зі scope-based політиками** (0.8 б.) | ШІ | `Program.cs` сервісів, `Platform.Aggregator/`, `Services/Payments/Payments.Api/` | `AddJwtBearer` із `Authority` та `Audience` + scope-політики (`orders.read/write`, `products.read/write`, `payments.read/write`) у `Program.cs` сервісів; `Platform.Aggregator/Auth/ClientCredentialsTokenHandler.cs` отримує M2M токен через `/connect/token`. | ✅ Виконано |
+| **10** | **Keycloak розгорнуто через Aspire (траєкторія Б)** (0.8 б.) | AST | `Platform.AppHost/`, `Program.cs` сервісів | `builder.AddKeycloak("keycloak", 8080).WithDataVolume()` у `Platform.AppHost/AppHost.cs` (`Aspire.Hosting.Keycloak`); `.WithReference(keycloak)` на сервісах; `AddKeycloakJwtBearer("keycloak", realm: "DevRealmDrivers", ...)` (`Aspire.Keycloak.Authentication`) у `Program.cs` сервісів. | ✅ Виконано |
+| **11** | **Pulumi описує realm, resource servers зі scopes і ролі за матрицею** (1.2 б.) | ШІ | `infra/keycloak/` | `KeycloakStack.cs`: `RealmName = "DevRealmDrivers"`, Resource Servers `orders-api`, `products-api`, `payments-api` з повним набором scopes, ролі `admin`/`manager`/`user`/`guest`, role policies та scope permissions за Таблицею 7 (`payments-api` — виключно `admin`). | ✅ Виконано |
+| **12** | **Clients і тестові користувачі створюються через Pulumi** (0.8 б.) | ШІ | `infra/keycloak/` | `KeycloakClientFactory.cs` (`CreateAuthorizationCodeClient`, `CreatePublicPkceClient`, `CreateClientCredentialsClient`) + `KeycloakClientExtensions.cs` (`AddAudienceMapper`, `AddPermissionsMapper`, `AttachDefaultScopes`); 4 тестові користувачі з temporary паролями й `EmailVerified = true`; outputs `RealmUrl`, `AdminConsoleUrl`, `ClientIds`, `ClientSecrets`. | ✅ Виконано |
+| **13** | **Permission-based авторизація `[RequirePermission]` на кожному ендпоінті** (1.4 б.) | ШІ | `Program.cs` сервісів, контролери `Sales.Api`, `Catalog.Api`, `Payments.Api` | `PermissionRequirement`, `[RequirePermission]` та `PermissionAuthorizationHandler` (парсить `authorization.permissions[].scopes[]` локально) у `Platform.ServiceDefaults/Authorization/PermissionAuthorization.cs`; атрибут застосовано на кожному ендпоінті `DealsController` (Orders), `ProductsController` (Products) та `PaymentsController` (Payments). | ✅ Виконано |

@@ -1,3 +1,4 @@
+using System.Text;
 using Catalog.Api.Grpc;
 using Catalog.Api.HealthChecks;
 using Catalog.Api.IntegrationEvents;
@@ -11,7 +12,9 @@ using Catalog.Dal.Interfaces;
 using Catalog.Dal.Seeding;
 using Catalog.Dal.UnitOfWork;
 using FluentValidation;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
 using Platform.EventBus.DependencyInjection;
 
@@ -19,6 +22,78 @@ var builder = WebApplication.CreateBuilder(args);
 
 // 1. Централізовані налаштування платформи .NET Aspire (Serilog, OpenTelemetry, HealthChecks, ServiceDiscovery)
 builder.AddServiceDefaults();
+
+// 1.1. Мультипровайдерна JWT-автентифікація: ASP.NET Identity JWT, Duende IdentityServer (Authority/Audience) та Keycloak (DevRealmDrivers)
+var jwtSection = builder.Configuration.GetSection("Jwt");
+var identityIssuer = jwtSection["Issuer"] ?? "Platform.Auth.Api";
+var identityAudience = jwtSection["Audience"] ?? "Platform.Microservices";
+var secretKey = jwtSection["SecretKey"] ?? "SuperSecretPlatformJwtSigningKey_Lab09_AtLeast32Chars!";
+var identityServerAuthority = builder.Configuration["IdentityServer:Authority"]
+                              ?? builder.Configuration["services:identityserver:http:0"]
+                              ?? "http://localhost:5005";
+
+builder.Services.AddAuthentication(options =>
+{
+    options.DefaultScheme = PlatformAuthenticationExtensions.MultiScheme;
+    options.DefaultAuthenticateScheme = PlatformAuthenticationExtensions.MultiScheme;
+    options.DefaultChallengeScheme = PlatformAuthenticationExtensions.MultiScheme;
+})
+.AddPolicyScheme(PlatformAuthenticationExtensions.MultiScheme, "Select JWT provider by issuer", options =>
+{
+    options.ForwardDefaultSelector = ctx => PlatformAuthenticationExtensions.SelectJwtScheme(ctx, identityIssuer);
+})
+.AddJwtBearer(PlatformAuthenticationExtensions.IdentityJwtScheme, options =>
+{
+    options.TokenValidationParameters = new TokenValidationParameters
+    {
+        ValidateIssuer = true,
+        ValidIssuer = identityIssuer,
+        ValidateAudience = true,
+        ValidAudience = identityAudience,
+        ValidateIssuerSigningKey = true,
+        IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secretKey)),
+        ValidateLifetime = true,
+        ClockSkew = TimeSpan.FromSeconds(30)
+    };
+})
+.AddJwtBearer(PlatformAuthenticationExtensions.IdentityServerScheme, options =>
+{
+    options.Authority = identityServerAuthority;
+    options.Audience = "products_api";
+    options.RequireHttpsMetadata = !builder.Environment.IsDevelopment();
+    options.TokenValidationParameters = new TokenValidationParameters
+    {
+        ValidateAudience = true,
+        ValidAudiences = ["products_api", $"{identityServerAuthority.TrimEnd('/')}/resources"]
+    };
+})
+.AddKeycloakJwtBearer(
+    serviceName: "keycloak",
+    realm: "DevRealmDrivers",
+    authenticationScheme: PlatformAuthenticationExtensions.KeycloakScheme,
+    configureOptions: options =>
+    {
+        options.Audience = "products-api";
+        if (builder.Environment.IsDevelopment())
+        {
+            options.RequireHttpsMetadata = false;
+        }
+    });
+
+builder.Services.AddSingleton<IAuthorizationHandler, PermissionAuthorizationHandler>();
+
+// 1.2. Політики авторизації: scope-based (IdentityServer) та permission-based [RequirePermission] (Keycloak — Таблиця 9)
+builder.Services.AddAuthorization(options =>
+{
+    options.AddPolicy("products.read", p => p.RequireClaim("scope", "products.read", "products_api"));
+    options.AddPolicy("products.write", p => p.RequireClaim("scope", "products.write", "products_api"));
+
+    options.AddPolicy("products:read", p => p.Requirements.Add(new PermissionRequirement("products:read")));
+    options.AddPolicy("products:create", p => p.Requirements.Add(new PermissionRequirement("products:create")));
+    options.AddPolicy("products:update", p => p.Requirements.Add(new PermissionRequirement("products:update")));
+    options.AddPolicy("products:delete", p => p.Requirements.Add(new PermissionRequirement("products:delete")));
+    options.AddPolicy("products:publish", p => p.Requirements.Add(new PermissionRequirement("products:publish")));
+});
 
 // 2. Глобальна обробка винятків у форматі ProblemDetails (RFC 7807/9457)
 builder.Services.AddExceptionHandler<GlobalExceptionHandler>();
@@ -108,6 +183,16 @@ builder.Services.AddSwaggerGen(c =>
         In = ParameterLocation.Header,
         Type = SecuritySchemeType.ApiKey
     });
+
+    c.AddSecurityDefinition("Bearer", new OpenApiSecurityScheme
+    {
+        Description = "JWT Authorization header: Bearer {token}",
+        Name = "Authorization",
+        In = ParameterLocation.Header,
+        Type = SecuritySchemeType.Http,
+        Scheme = "bearer",
+        BearerFormat = "JWT"
+    });
 });
 
 var app = builder.Build();
@@ -125,6 +210,10 @@ if (app.Environment.IsDevelopment() || true) // Дозволяємо Swagger д�
         c.SwaggerEndpoint("/swagger/v1/swagger.json", "Catalog API v1");
     });
 }
+
+// Аутентифікація та авторизація (JWT Identity / IdentityServer / Keycloak + PermissionAuthorizationHandler)
+app.UseAuthentication();
+app.UseAuthorization();
 
 app.MapGet("/", () => Results.Redirect("/swagger"));
 app.MapDefaultEndpoints();

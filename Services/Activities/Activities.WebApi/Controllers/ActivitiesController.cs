@@ -9,11 +9,13 @@ using Activities.Application.Common.Models;
 using Activities.WebApi.Contracts;
 using Activities.WebApi.Metrics;
 using AutoMapper;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 
 namespace Activities.WebApi.Controllers;
 
 [Route("api/activities")]
+[Authorize]
 public class ActivitiesController : ApiControllerBase
 {
     private readonly IMapper _mapper;

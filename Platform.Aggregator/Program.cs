@@ -1,13 +1,17 @@
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Catalog.Grpc;
 using Grpc.Core;
 using Grpc.Health.V1;
 using Grpc.Net.Client.Configuration;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Http.Resilience;
+using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
 using Orders.Grpc;
+using Platform.Aggregator.Auth;
 using Platform.Aggregator.Clients;
 using Platform.Aggregator.Grpc;
 using Platform.Aggregator.HealthChecks;
@@ -20,6 +24,74 @@ var builder = WebApplication.CreateBuilder(args);
 
 // 1. Спільні налаштування платформи (Serilog, OpenTelemetry + Polly Meter, ServiceDiscovery, StandardResilienceHandler, CorrelationId)
 builder.AddServiceDefaults();
+
+// 1.1. Мультипровайдерна JWT-автентифікація (ASP.NET Identity JWT, Duende IdentityServer, Keycloak DevRealmDrivers)
+var jwtSection = builder.Configuration.GetSection("Jwt");
+var identityIssuer = jwtSection["Issuer"] ?? "Platform.Auth.Api";
+var identityAudience = jwtSection["Audience"] ?? "Platform.Microservices";
+var secretKey = jwtSection["SecretKey"] ?? "SuperSecretPlatformJwtSigningKey_Lab09_AtLeast32Chars!";
+var identityServerAuthority = builder.Configuration["IdentityServer:Authority"]
+                              ?? builder.Configuration["services:identityserver:http:0"]
+                              ?? "http://localhost:5005";
+
+builder.Services.AddAuthentication(options =>
+{
+    options.DefaultScheme = PlatformAuthenticationExtensions.MultiScheme;
+    options.DefaultAuthenticateScheme = PlatformAuthenticationExtensions.MultiScheme;
+    options.DefaultChallengeScheme = PlatformAuthenticationExtensions.MultiScheme;
+})
+.AddPolicyScheme(PlatformAuthenticationExtensions.MultiScheme, "Select JWT provider by issuer", options =>
+{
+    options.ForwardDefaultSelector = ctx => PlatformAuthenticationExtensions.SelectJwtScheme(ctx, identityIssuer);
+})
+.AddJwtBearer(PlatformAuthenticationExtensions.IdentityJwtScheme, options =>
+{
+    options.TokenValidationParameters = new TokenValidationParameters
+    {
+        ValidateIssuer = true,
+        ValidIssuer = identityIssuer,
+        ValidateAudience = true,
+        ValidAudience = identityAudience,
+        ValidateIssuerSigningKey = true,
+        IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secretKey)),
+        ValidateLifetime = true,
+        ClockSkew = TimeSpan.FromSeconds(30)
+    };
+})
+.AddJwtBearer(PlatformAuthenticationExtensions.IdentityServerScheme, options =>
+{
+    options.Authority = identityServerAuthority;
+    options.Audience = "orders_api";
+    options.RequireHttpsMetadata = !builder.Environment.IsDevelopment();
+    options.TokenValidationParameters = new TokenValidationParameters
+    {
+        ValidateAudience = true,
+        ValidAudiences = ["orders_api", "products_api", $"{identityServerAuthority.TrimEnd('/')}/resources"]
+    };
+})
+.AddKeycloakJwtBearer(
+    serviceName: "keycloak",
+    realm: "DevRealmDrivers",
+    authenticationScheme: PlatformAuthenticationExtensions.KeycloakScheme,
+    configureOptions: options =>
+    {
+        options.Audience = "orders-api";
+        if (builder.Environment.IsDevelopment())
+        {
+            options.RequireHttpsMetadata = false;
+        }
+    });
+
+builder.Services.AddSingleton<IAuthorizationHandler, PermissionAuthorizationHandler>();
+builder.Services.AddAuthorization(options =>
+{
+    options.AddPolicy("orders:read", p => p.Requirements.Add(new PermissionRequirement("orders:read")));
+});
+
+// 1.2. OAuth 2.0 Client Credentials Flow (Machine-to-Machine) для викликів downstream-сервісів
+builder.Services.AddHttpContextAccessor();
+builder.Services.AddHttpClient("identityserver-token");
+builder.Services.AddTransient<ClientCredentialsTokenHandler>();
 
 // 2. Розподілений кеш Redis для збереження агрегованих відповідей (TTL 30 с, graceful degradation при збої Redis)
 // DisableHealthChecks = true вимикає стандартну Unhealthy-перевірку Aspire, щоб діяла наша Degraded-перевірка redis-cache
@@ -49,6 +121,7 @@ builder.Services.AddGrpcClient<OrdersService.OrdersServiceClient>(o =>
         StatusCode.Unavailable,
         StatusCode.ResourceExhausted))
     .RemoveAllResilienceHandlers()
+    .AddHttpMessageHandler<ClientCredentialsTokenHandler>()
     .AddStandardResilienceHandler()
     .Configure((o, sp) => ConfigureCriticalOrdersResilience(o, sp, "orders-api-grpc", disableUnsafeHttpMethods: false));
 
@@ -64,6 +137,7 @@ builder.Services.AddGrpcClient<CatalogService.CatalogServiceClient>(o =>
         StatusCode.ResourceExhausted,
         StatusCode.DeadlineExceeded))
     .RemoveAllResilienceHandlers()
+    .AddHttpMessageHandler<ClientCredentialsTokenHandler>()
     .AddStandardResilienceHandler()
     .Configure((o, sp) => ConfigureCriticalCatalogResilience(o, sp, "catalog-api-grpc", disableUnsafeHttpMethods: false));
 
@@ -77,35 +151,41 @@ builder.Services.AddGrpcClient<ReviewsService.ReviewsServiceClient>(o =>
         maxBackoff: TimeSpan.FromSeconds(1),
         StatusCode.Unavailable))
     .RemoveAllResilienceHandlers()
+    .AddHttpMessageHandler<ClientCredentialsTokenHandler>()
     .AddStandardResilienceHandler()
     .Configure((o, sp) => ConfigureNonCriticalReviewsResilience(o, sp, "reviews-api-grpc", disableUnsafeHttpMethods: false));
 
 // ============================================================================
-// 5. Typed HttpClients (REST-резерв із Лаб. 05) з кастомними політиками та DisableForUnsafeHttpMethods()
+// 5. Typed HttpClients (REST-резерв із Лаб. 05) з кастомними політиками, Client Credentials та DisableForUnsafeHttpMethods()
 // ============================================================================
 
 builder.Services.AddHttpClient<OrdersClient>(c => c.BaseAddress = new("https+http://orders-api"))
     .RemoveAllResilienceHandlers()
+    .AddHttpMessageHandler<ClientCredentialsTokenHandler>()
     .AddStandardResilienceHandler()
     .Configure((o, sp) => ConfigureCriticalOrdersResilience(o, sp, "orders-api-http", disableUnsafeHttpMethods: true));
 
 builder.Services.AddHttpClient<SalesClient>(c => c.BaseAddress = new("https+http://sales-api"))
     .RemoveAllResilienceHandlers()
+    .AddHttpMessageHandler<ClientCredentialsTokenHandler>()
     .AddStandardResilienceHandler()
     .Configure((o, sp) => ConfigureCriticalOrdersResilience(o, sp, "sales-api-http", disableUnsafeHttpMethods: true));
 
 builder.Services.AddHttpClient<CatalogClient>(c => c.BaseAddress = new("https+http://catalog-api"))
     .RemoveAllResilienceHandlers()
+    .AddHttpMessageHandler<ClientCredentialsTokenHandler>()
     .AddStandardResilienceHandler()
     .Configure((o, sp) => ConfigureCriticalCatalogResilience(o, sp, "catalog-api-http", disableUnsafeHttpMethods: true));
 
 builder.Services.AddHttpClient<ReviewsClient>(c => c.BaseAddress = new("https+http://reviews-api"))
     .RemoveAllResilienceHandlers()
+    .AddHttpMessageHandler<ClientCredentialsTokenHandler>()
     .AddStandardResilienceHandler()
     .Configure((o, sp) => ConfigureNonCriticalReviewsResilience(o, sp, "reviews-api-http", disableUnsafeHttpMethods: true));
 
 builder.Services.AddHttpClient<ActivitiesClient>(c => c.BaseAddress = new("https+http://activities-api"))
     .RemoveAllResilienceHandlers()
+    .AddHttpMessageHandler<ClientCredentialsTokenHandler>()
     .AddStandardResilienceHandler()
     .Configure((o, sp) => ConfigureNonCriticalReviewsResilience(o, sp, "activities-api-http", disableUnsafeHttpMethods: true));
 
@@ -193,6 +273,9 @@ app.UseSwaggerUI(c =>
     c.SwaggerEndpoint("/swagger/v1/swagger.json", "Aggregator API v1");
     c.RoutePrefix = "swagger";
 });
+
+app.UseAuthentication();
+app.UseAuthorization();
 
 app.MapGet("/", () => Results.Redirect("/swagger"));
 app.MapDefaultEndpoints();

@@ -8,11 +8,13 @@ using Activities.Application.Reviews.Queries.GetReviewsList;
 using Activities.WebApi.Contracts;
 using Activities.WebApi.Metrics;
 using AutoMapper;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 
 namespace Activities.WebApi.Controllers;
 
 [Route("api/reviews")]
+[Authorize]
 public class ReviewsController : ApiControllerBase
 {
     private readonly IMapper _mapper;

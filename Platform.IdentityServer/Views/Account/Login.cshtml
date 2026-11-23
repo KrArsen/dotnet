@@ -1,0 +1,37 @@
+@{
+    Layout = null;
+    var returnUrl = ViewData["ReturnUrl"] as string ?? "/";
+    var clientName = ViewData["ClientName"] as string ?? "CRM Platform";
+    var error = ViewData["Error"] as string;
+}
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+    <meta charset="utf-8" />
+    <title>Sign In — Platform IdentityServer</title>
+    <link rel="stylesheet" href="/css/site.css" />
+</head>
+<body>
+    <div class="auth-card">
+        <h1>Platform IdentityServer</h1>
+        <p class="subtitle">Вхід для клієнта <strong>@clientName</strong></p>
+        @if (!string.IsNullOrWhiteSpace(error))
+        {
+            <div class="alert">@error</div>
+        }
+        <form method="post" action="/Account/Login">
+            @Html.AntiForgeryToken()
+            <input type="hidden" name="returnUrl" value="@returnUrl" />
+            <label for="username">Username або Email</label>
+            <input id="username" name="username" type="text" required autofocus placeholder="alice" />
+            <label for="password">Пароль</label>
+            <input id="password" name="password" type="password" required placeholder="Pass123$" />
+            <label class="checkbox">
+                <input name="rememberLogin" type="checkbox" value="true" /> Запам'ятати мене
+            </label>
+            <button type="submit">Увійти</button>
+        </form>
+        <p class="hint">Демо: <code>alice / Pass123$</code> (Admin) або <code>bob / Pass123$</code> (User)</p>
+    </div>
+</body>
+</html>

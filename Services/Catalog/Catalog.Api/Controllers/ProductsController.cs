@@ -1,15 +1,22 @@
 using System.Diagnostics;
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
 using System.Text.Json;
 using Catalog.Api.Metrics;
 using Catalog.Bll.DTOs;
 using Catalog.Bll.Services;
 using FluentValidation;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 
 namespace Catalog.Api.Controllers;
 
+public sealed record UpdateProductRequest(string? Name = null, decimal? Price = null, string? Reason = null);
+
 [ApiController]
+[Authorize]
 [Route("api/products")]
+[Route("products")]
 [Produces("application/json")]
 public class ProductsController : ControllerBase
 {
@@ -36,10 +43,20 @@ public class ProductsController : ControllerBase
         _metrics = metrics;
     }
 
+    private string ResolveActor(string? headerUser) =>
+        User.FindFirstValue("preferred_username")
+        ?? User.FindFirstValue(JwtRegisteredClaimNames.UniqueName)
+        ?? User.FindFirstValue(ClaimTypes.Name)
+        ?? User.FindFirstValue(JwtRegisteredClaimNames.Sub)
+        ?? User.FindFirstValue(ClaimTypes.NameIdentifier)
+        ?? headerUser
+        ?? "system";
+
     /// <summary>
     /// Отримати список позицій каталогу з пагінацією, фільтрацією та сортуванням на рівні SQL
     /// </summary>
     [HttpGet]
+    [RequirePermission("products:read")]
     [ProducesResponseType(typeof(PagedResult<ProductDto>), StatusCodes.Status200OK)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status400BadRequest)]
     public async Task<ActionResult<PagedResult<ProductDto>>> GetPaged([FromQuery] ProductQuery query, CancellationToken ct)
@@ -90,6 +107,7 @@ public class ProductsController : ControllerBase
     /// Отримати детальну інформацію про позицію каталогу за ID (демонстрація Eager Loading)
     /// </summary>
     [HttpGet("{id:long}")]
+    [RequirePermission("products:read")]
     [ProducesResponseType(typeof(ProductDto), StatusCodes.Status200OK)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status404NotFound)]
     public async Task<ActionResult<ProductDto>> GetById(long id, CancellationToken ct)
@@ -114,9 +132,10 @@ public class ProductsController : ControllerBase
     }
 
     /// <summary>
-    /// Створити нову позицію каталогу
+    /// Створити нову позицію каталогу (вимагає products:create — доступно лише admin)
     /// </summary>
     [HttpPost]
+    [RequirePermission("products:create")]
     [ProducesResponseType(typeof(ProductDto), StatusCodes.Status201Created)]
     [ProducesResponseType(typeof(ValidationProblemDetails), StatusCodes.Status400BadRequest)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status409Conflict)]
@@ -141,7 +160,7 @@ public class ProductsController : ControllerBase
         var sw = Stopwatch.StartNew();
         try
         {
-            var created = await _productService.CreateAsync(dto, user ?? "system", ct);
+            var created = await _productService.CreateAsync(dto, ResolveActor(user), ct);
             _metrics?.ProductCreated(created.ItemType ?? "Service");
             _metrics?.RecordDuration("create", success: true, sw.Elapsed.TotalMilliseconds);
             return CreatedAtAction(nameof(GetById), new { id = created.Id }, created);
@@ -158,9 +177,88 @@ public class ProductsController : ControllerBase
     }
 
     /// <summary>
+    /// Оновити позицію каталогу (назву та/або ціну — вимагає products:update)
+    /// </summary>
+    [HttpPut("{id:long}")]
+    [RequirePermission("products:update")]
+    [ProducesResponseType(typeof(ProductDto), StatusCodes.Status200OK)]
+    [ProducesResponseType(typeof(ValidationProblemDetails), StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status404NotFound)]
+    public async Task<ActionResult<ProductDto>> Update(
+        long id,
+        [FromBody] UpdateProductRequest request,
+        [FromHeader(Name = "X-User")] string? user,
+        CancellationToken ct)
+    {
+        var actor = ResolveActor(user);
+        _metrics?.RequestStarted();
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(request.Name))
+            {
+                await _productService.RenameAsync(id, new RenameProductDto(request.Name), actor, ct);
+            }
+
+            if (request.Price.HasValue)
+            {
+                var priceDto = new UpdatePriceDto(request.Price.Value, request.Reason ?? "Updated via PUT /products/{id}");
+                var validationResult = await _updatePriceValidator.ValidateAsync(priceDto, ct);
+                if (!validationResult.IsValid)
+                {
+                    return ValidationProblem(new ValidationProblemDetails(validationResult.ToDictionary()));
+                }
+
+                await _productService.UpdatePriceAsync(id, priceDto, actor, ct);
+            }
+
+            var updated = await _productService.GetByIdAsync(id, ct);
+            _metrics?.ProductUpdated("product");
+            _metrics?.RecordDuration("update", success: true, sw.Elapsed.TotalMilliseconds);
+            return Ok(updated);
+        }
+        catch
+        {
+            _metrics?.RecordDuration("update", success: false, sw.Elapsed.TotalMilliseconds);
+            throw;
+        }
+        finally
+        {
+            _metrics?.RequestCompleted();
+        }
+    }
+
+    /// <summary>
+    /// Опублікувати позицію каталогу у вітрину (вимагає products:publish — admin / manager)
+    /// </summary>
+    [HttpPost("{id:long}/publish")]
+    [RequirePermission("products:publish")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status404NotFound)]
+    public async Task<IActionResult> Publish(
+        long id,
+        [FromHeader(Name = "X-User")] string? user,
+        CancellationToken ct)
+    {
+        var actor = ResolveActor(user);
+        var product = await _productService.GetByIdAsync(id, ct);
+
+        return Ok(new
+        {
+            product.Id,
+            product.Sku,
+            product.Name,
+            published = true,
+            publishedBy = actor,
+            publishedAtUtc = DateTime.UtcNow
+        });
+    }
+
+    /// <summary>
     /// Змінити ціну позиції каталогу з фіксацією в історії тарифів
     /// </summary>
     [HttpPut("{id:long}/price")]
+    [RequirePermission("products:update")]
     [ProducesResponseType(StatusCodes.Status204NoContent)]
     [ProducesResponseType(typeof(ValidationProblemDetails), StatusCodes.Status400BadRequest)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status404NotFound)]
@@ -184,7 +282,7 @@ public class ProductsController : ControllerBase
         var sw = Stopwatch.StartNew();
         try
         {
-            await _productService.UpdatePriceAsync(id, dto, user ?? "system", ct);
+            await _productService.UpdatePriceAsync(id, dto, ResolveActor(user), ct);
             _metrics?.ProductUpdated("price");
             _metrics?.RecordDuration("update_price", success: true, sw.Elapsed.TotalMilliseconds);
             return NoContent();
@@ -204,6 +302,7 @@ public class ProductsController : ControllerBase
     /// Перейменувати позицію каталогу та опублікувати подію ProductRenamedEvent (оновлює Sales та Reviews)
     /// </summary>
     [HttpPut("{id:long}/name")]
+    [RequirePermission("products:update")]
     [ProducesResponseType(StatusCodes.Status204NoContent)]
     [ProducesResponseType(typeof(ValidationProblemDetails), StatusCodes.Status400BadRequest)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status404NotFound)]
@@ -217,7 +316,7 @@ public class ProductsController : ControllerBase
         var sw = Stopwatch.StartNew();
         try
         {
-            await _productService.RenameAsync(id, dto, user ?? "system", ct);
+            await _productService.RenameAsync(id, dto, ResolveActor(user), ct);
             _metrics?.ProductUpdated("name");
             _metrics?.RecordDuration("rename", success: true, sw.Elapsed.TotalMilliseconds);
             return NoContent();
@@ -237,6 +336,7 @@ public class ProductsController : ControllerBase
     /// Списати залишок товару на складі
     /// </summary>
     [HttpPost("{id:long}/stock/remove")]
+    [RequirePermission("products:update")]
     [ProducesResponseType(StatusCodes.Status204NoContent)]
     [ProducesResponseType(typeof(ValidationProblemDetails), StatusCodes.Status400BadRequest)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status404NotFound)]
@@ -273,6 +373,7 @@ public class ProductsController : ControllerBase
     /// Поповнити залишок товару на складі
     /// </summary>
     [HttpPost("{id:long}/stock/add")]
+    [RequirePermission("products:update")]
     [ProducesResponseType(StatusCodes.Status204NoContent)]
     [ProducesResponseType(typeof(ValidationProblemDetails), StatusCodes.Status400BadRequest)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status404NotFound)]
@@ -305,9 +406,10 @@ public class ProductsController : ControllerBase
     }
 
     /// <summary>
-    /// Видалити позицію каталогу (Soft Delete)
+    /// Видалити позицію каталогу (Soft Delete — вимагає products:delete, доступно лише admin)
     /// </summary>
     [HttpDelete("{id:long}")]
+    [RequirePermission("products:delete")]
     [ProducesResponseType(StatusCodes.Status204NoContent)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status404NotFound)]
     public async Task<IActionResult> Delete(
@@ -319,7 +421,7 @@ public class ProductsController : ControllerBase
         var sw = Stopwatch.StartNew();
         try
         {
-            await _productService.DeleteAsync(id, user ?? "system", ct);
+            await _productService.DeleteAsync(id, ResolveActor(user), ct);
             _metrics?.ProductDeleted();
             _metrics?.RecordDuration("delete", success: true, sw.Elapsed.TotalMilliseconds);
             return NoContent();
@@ -339,6 +441,7 @@ public class ProductsController : ControllerBase
     /// Отримати товари певної категорії за допомогою специфікації ProductsByCategorySpec
     /// </summary>
     [HttpGet("by-category/{categoryId:long}")]
+    [RequirePermission("products:read")]
     [ProducesResponseType(typeof(IReadOnlyList<ProductDto>), StatusCodes.Status200OK)]
     public async Task<ActionResult<IReadOnlyList<ProductDto>>> GetByCategory(long categoryId, CancellationToken ct)
     {

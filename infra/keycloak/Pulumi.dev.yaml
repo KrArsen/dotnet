@@ -1,0 +1,6 @@
+config:
+  keycloak:url: http://localhost:8080
+  keycloak:clientId: admin-cli
+  keycloak:username: admin
+  keycloak:password: admin123
+  keycloak:realm: master

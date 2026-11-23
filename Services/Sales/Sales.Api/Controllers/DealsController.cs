@@ -1,4 +1,7 @@
 using System.Diagnostics;
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Sales.Api.Metrics;
 using Sales.Bll.Caching;
@@ -9,8 +12,10 @@ using Sales.Domain.Exceptions;
 namespace Sales.Api.Controllers;
 
 [ApiController]
+[Authorize]
 [Route("api/[controller]")]
 [Route("api/orders")]
+[Route("orders")]
 [Produces("application/json")]
 public class DealsController : ControllerBase
 {
@@ -28,10 +33,20 @@ public class DealsController : ControllerBase
         _metrics = metrics;
     }
 
+    private string ResolveActor(string? headerUser) =>
+        User.FindFirstValue("preferred_username")
+        ?? User.FindFirstValue(JwtRegisteredClaimNames.UniqueName)
+        ?? User.FindFirstValue(ClaimTypes.Name)
+        ?? User.FindFirstValue(JwtRegisteredClaimNames.Sub)
+        ?? User.FindFirstValue(ClaimTypes.NameIdentifier)
+        ?? headerUser
+        ?? "system";
+
     /// <summary>
     /// Отримати список угод із фільтрацією та пагінацією через представлення vw_DealSummary
     /// </summary>
     [HttpGet]
+    [RequirePermission("orders:read")]
     [ProducesResponseType(typeof(PagedResult<DealSummaryDto>), StatusCodes.Status200OK)]
     public async Task<ActionResult<PagedResult<DealSummaryDto>>> GetPage(
         [FromQuery] DealQueryDto query,
@@ -55,6 +70,7 @@ public class DealsController : ControllerBase
     /// Отримати детальну інформацію про угоду (включно з позиціями, деталями та історією стадій)
     /// </summary>
     [HttpGet("{id:long}")]
+    [RequirePermission("orders:read")]
     [ProducesResponseType(typeof(DealDto), StatusCodes.Status200OK)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status404NotFound)]
     public async Task<ActionResult<DealDto>> GetById(long id, CancellationToken ct)
@@ -82,6 +98,7 @@ public class DealsController : ControllerBase
     /// Отримати агреговану статистику воронки угод за стадіями
     /// </summary>
     [HttpGet("stats")]
+    [RequirePermission("orders:read")]
     [ProducesResponseType(typeof(IReadOnlyList<DealStatsDto>), StatusCodes.Status200OK)]
     public async Task<ActionResult<IReadOnlyList<DealStatsDto>>> GetStats(CancellationToken ct)
     {
@@ -90,9 +107,10 @@ public class DealsController : ControllerBase
     }
 
     /// <summary>
-    /// Створити нову угоду з позиціями та початковою стадією Lead (з підтримкою Idempotency-Key)
+    /// Створити нову угоду з позиціями та початковою стадією Lead (з підтримкою Idempotency-Key та JWT claims)
     /// </summary>
     [HttpPost]
+    [RequirePermission("orders:create")]
     [ProducesResponseType(typeof(DealDto), StatusCodes.Status201Created)]
     [ProducesResponseType(typeof(ValidationProblemDetails), StatusCodes.Status400BadRequest)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status404NotFound)]
@@ -103,7 +121,7 @@ public class DealsController : ControllerBase
         [FromHeader(Name = "X-User")] string? user,
         CancellationToken ct)
     {
-        var username = user ?? "system";
+        var username = ResolveActor(user);
 
         if (!string.IsNullOrWhiteSpace(idempotencyKey))
         {
@@ -137,9 +155,44 @@ public class DealsController : ControllerBase
     }
 
     /// <summary>
+    /// Оновити угоду/замовлення (перевести на наступну стадію або оновити коментар змін від імені JWT-користувача)
+    /// </summary>
+    [HttpPut("{id:long}")]
+    [RequirePermission("orders:update")]
+    [ProducesResponseType(typeof(DealDto), StatusCodes.Status200OK)]
+    [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status404NotFound)]
+    [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status409Conflict)]
+    public async Task<ActionResult<DealDto>> Update(
+        long id,
+        [FromBody] AdvanceDealDto? dto,
+        [FromHeader(Name = "X-User")] string? user,
+        CancellationToken ct)
+    {
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            await _dealService.AdvanceAsync(id, ResolveActor(user), dto?.Reason ?? "Updated via PUT /orders/{id}", ct);
+            var updated = await _dealService.GetByIdAsync(id, ct);
+            if (updated == null)
+            {
+                throw new NotFoundException($"Угоду з ID {id} не знайдено.");
+            }
+
+            _metrics?.RecordDuration("update", success: true, sw.Elapsed.TotalMilliseconds);
+            return Ok(updated);
+        }
+        catch
+        {
+            _metrics?.RecordDuration("update", success: false, sw.Elapsed.TotalMilliseconds);
+            throw;
+        }
+    }
+
+    /// <summary>
     /// Додати товарну або послугову позицію до відкритої угоди
     /// </summary>
     [HttpPost("{id:long}/items")]
+    [RequirePermission("orders:update")]
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(typeof(ValidationProblemDetails), StatusCodes.Status400BadRequest)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status404NotFound)]
@@ -153,7 +206,7 @@ public class DealsController : ControllerBase
         var sw = Stopwatch.StartNew();
         try
         {
-            await _dealService.AddItemAsync(id, dto, user ?? "system", ct);
+            await _dealService.AddItemAsync(id, dto, ResolveActor(user), ct);
             var updated = await _dealService.GetByIdAsync(id, ct);
             _metrics?.RecordDuration("add_item", success: true, sw.Elapsed.TotalMilliseconds);
             return Ok(updated);
@@ -169,6 +222,7 @@ public class DealsController : ControllerBase
     /// Перевести угоду на наступну стадію воронки (Prospect -> Negotiation -> Won)
     /// </summary>
     [HttpPost("{id:long}/advance")]
+    [RequirePermission("orders:update")]
     [ProducesResponseType(StatusCodes.Status204NoContent)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status404NotFound)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status409Conflict)]
@@ -181,7 +235,7 @@ public class DealsController : ControllerBase
         var sw = Stopwatch.StartNew();
         try
         {
-            await _dealService.AdvanceAsync(id, user ?? "system", dto?.Reason, ct);
+            await _dealService.AdvanceAsync(id, ResolveActor(user), dto?.Reason, ct);
             _metrics?.RecordDuration("advance", success: true, sw.Elapsed.TotalMilliseconds);
             return NoContent();
         }
@@ -193,11 +247,13 @@ public class DealsController : ControllerBase
     }
 
     /// <summary>
-    /// Успішно закрити угоду (Won).
+    /// Підтвердити / успішно закрити угоду (Won / Approve — вимагає orders:approve).
     /// Демонструє розподілену атомарну транзакцію Unit of Work через два репозиторії:
     /// Dapper Stored Procedure для угоди + ADO.NET для оновлення статистики клієнта.
     /// </summary>
     [HttpPost("{id:long}/win")]
+    [HttpPost("{id:long}/approve")]
+    [RequirePermission("orders:approve")]
     [ProducesResponseType(StatusCodes.Status204NoContent)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status404NotFound)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status409Conflict)]
@@ -220,7 +276,7 @@ public class DealsController : ControllerBase
         var sw = Stopwatch.StartNew();
         try
         {
-            await _dealService.WinDealAsync(id, user ?? "system", ct);
+            await _dealService.WinDealAsync(id, ResolveActor(user), ct);
 
             if (!string.IsNullOrWhiteSpace(idempotencyKey))
             {
@@ -242,6 +298,7 @@ public class DealsController : ControllerBase
     /// Закрити угоду як програну (Lost) із зазначенням обов'язкової причини зриву
     /// </summary>
     [HttpPost("{id:long}/lose")]
+    [RequirePermission("orders:update")]
     [ProducesResponseType(StatusCodes.Status204NoContent)]
     [ProducesResponseType(typeof(ValidationProblemDetails), StatusCodes.Status400BadRequest)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status404NotFound)]
@@ -255,7 +312,7 @@ public class DealsController : ControllerBase
         var sw = Stopwatch.StartNew();
         try
         {
-            await _dealService.LoseAsync(id, dto, user ?? "system", ct);
+            await _dealService.LoseAsync(id, dto, ResolveActor(user), ct);
             _metrics?.OrderLost();
             _metrics?.RecordDuration("lose", success: true, sw.Elapsed.TotalMilliseconds);
             return NoContent();
@@ -268,9 +325,10 @@ public class DealsController : ControllerBase
     }
 
     /// <summary>
-    /// М'яке видалення угоди (Soft Delete)
+    /// М'яке видалення угоди (Soft Delete — вимагає orders:delete, доступно лише admin)
     /// </summary>
     [HttpDelete("{id:long}")]
+    [RequirePermission("orders:delete")]
     [ProducesResponseType(StatusCodes.Status204NoContent)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status404NotFound)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status409Conflict)]
@@ -282,7 +340,7 @@ public class DealsController : ControllerBase
         var sw = Stopwatch.StartNew();
         try
         {
-            await _dealService.SoftDeleteAsync(id, user ?? "system", ct);
+            await _dealService.SoftDeleteAsync(id, ResolveActor(user), ct);
             _metrics?.RecordDuration("delete", success: true, sw.Elapsed.TotalMilliseconds);
             return NoContent();
         }

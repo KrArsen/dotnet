@@ -1,0 +1,3 @@
+name: keycloak-infra
+runtime: dotnet
+description: Pulumi IaC provisioning for Keycloak DevRealmDrivers (Resource Servers, Scopes, Roles, Permission Policies, Clients, Test Users)

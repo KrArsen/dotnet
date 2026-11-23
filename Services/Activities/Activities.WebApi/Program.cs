@@ -1,3 +1,4 @@
+using System.Text;
 using Activities.Application;
 using Activities.Application.Common.Mappings;
 using Activities.Infrastructure;
@@ -6,6 +7,8 @@ using Activities.WebApi.IntegrationEvents;
 using Activities.WebApi.Mapping;
 using Activities.WebApi.Metrics;
 using Activities.WebApi.Middleware;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
 using Platform.EventBus.DependencyInjection;
 
@@ -13,6 +16,66 @@ var builder = WebApplication.CreateBuilder(args);
 
 // 1. Централізовані налаштування платформи .NET Aspire (Serilog, OpenTelemetry, HealthChecks, ServiceDiscovery)
 builder.AddServiceDefaults();
+
+// 1.1. Мультипровайдерна JWT-автентифікація: ASP.NET Identity JWT, Duende IdentityServer та Keycloak (DevRealmDrivers)
+var jwtSection = builder.Configuration.GetSection("Jwt");
+var identityIssuer = jwtSection["Issuer"] ?? "Platform.Auth.Api";
+var identityAudience = jwtSection["Audience"] ?? "Platform.Microservices";
+var secretKey = jwtSection["SecretKey"] ?? "SuperSecretPlatformJwtSigningKey_Lab09_AtLeast32Chars!";
+var identityServerAuthority = builder.Configuration["IdentityServer:Authority"]
+                              ?? builder.Configuration["services:identityserver:http:0"]
+                              ?? "http://localhost:5005";
+
+builder.Services.AddAuthentication(options =>
+{
+    options.DefaultScheme = PlatformAuthenticationExtensions.MultiScheme;
+    options.DefaultAuthenticateScheme = PlatformAuthenticationExtensions.MultiScheme;
+    options.DefaultChallengeScheme = PlatformAuthenticationExtensions.MultiScheme;
+})
+.AddPolicyScheme(PlatformAuthenticationExtensions.MultiScheme, "Select JWT provider by issuer", options =>
+{
+    options.ForwardDefaultSelector = ctx => PlatformAuthenticationExtensions.SelectJwtScheme(ctx, identityIssuer);
+})
+.AddJwtBearer(PlatformAuthenticationExtensions.IdentityJwtScheme, options =>
+{
+    options.TokenValidationParameters = new TokenValidationParameters
+    {
+        ValidateIssuer = true,
+        ValidIssuer = identityIssuer,
+        ValidateAudience = true,
+        ValidAudience = identityAudience,
+        ValidateIssuerSigningKey = true,
+        IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secretKey)),
+        ValidateLifetime = true,
+        ClockSkew = TimeSpan.FromSeconds(30)
+    };
+})
+.AddJwtBearer(PlatformAuthenticationExtensions.IdentityServerScheme, options =>
+{
+    options.Authority = identityServerAuthority;
+    options.Audience = "orders_api";
+    options.RequireHttpsMetadata = !builder.Environment.IsDevelopment();
+    options.TokenValidationParameters = new TokenValidationParameters
+    {
+        ValidateAudience = true,
+        ValidAudiences = ["orders_api", "products_api", $"{identityServerAuthority.TrimEnd('/')}/resources"]
+    };
+})
+.AddKeycloakJwtBearer(
+    serviceName: "keycloak",
+    realm: "DevRealmDrivers",
+    authenticationScheme: PlatformAuthenticationExtensions.KeycloakScheme,
+    configureOptions: options =>
+    {
+        options.Audience = "orders-api";
+        if (builder.Environment.IsDevelopment())
+        {
+            options.RequireHttpsMetadata = false;
+        }
+    });
+
+builder.Services.AddSingleton<IAuthorizationHandler, PermissionAuthorizationHandler>();
+builder.Services.AddAuthorization();
 
 // 2. Глобальна обробка винятків RFC 7807/9457 ProblemDetails
 builder.Services.AddExceptionHandler<GlobalExceptionHandler>();
@@ -88,6 +151,9 @@ if (app.Environment.IsDevelopment() || true)
         c.RoutePrefix = "swagger";
     });
 }
+
+app.UseAuthentication();
+app.UseAuthorization();
 
 app.MapGet("/", () => Results.Redirect("/swagger"));
 app.MapDefaultEndpoints();

@@ -1,0 +1,460 @@
+{
+  "info": {
+    "name": "Lab 09 — Microservices Auth (ASP.NET Identity JWT + Duende IdentityServer + Keycloak Permission Matrix)",
+    "_postman_id": "9f3b7c21-8c9a-4a51-9a21-lab09platform",
+    "description": "Повна Postman-колекція для тестування Лабораторної роботи №09: Частина 1 (ASP.NET Identity + JWT + Refresh Rotation), Частина 2 (Duende IdentityServer OAuth 2.0), Частина 3 (Keycloak DevRealmDrivers + Permission-Based Authorization Matrix).",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "gatewayUrl", "value": "http://localhost:5000" },
+    { "key": "identityServerUrl", "value": "http://localhost:5005" },
+    { "key": "keycloakUrl", "value": "http://localhost:8080" },
+    { "key": "realm", "value": "DevRealmDrivers" },
+    { "key": "accessToken", "value": "" },
+    { "key": "m2mToken", "value": "" },
+    { "key": "kcToken", "value": "" },
+    { "key": "userId", "value": "" },
+    { "key": "emailVerifyToken", "value": "" },
+    { "key": "resetPasswordToken", "value": "" }
+  ],
+  "item": [
+    {
+      "name": "Part 1 — ASP.NET Identity + JWT",
+      "item": [
+        {
+          "name": "1.1 Register User",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"userName\": \"student1\",\n  \"email\": \"student1@studio.ua\",\n  \"password\": \"StrongPass1!\",\n  \"fullName\": \"Test Student\"\n}"
+            },
+            "url": { "raw": "{{gatewayUrl}}/auth/register", "host": ["{{gatewayUrl}}"], "path": ["auth", "register"] }
+          }
+        },
+        {
+          "name": "1.2 Verify Email",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"userId\": \"{{userId}}\",\n  \"token\": \"{{emailVerifyToken}}\"\n}"
+            },
+            "url": { "raw": "{{gatewayUrl}}/auth/verify-email", "host": ["{{gatewayUrl}}"], "path": ["auth", "verify-email"] }
+          }
+        },
+        {
+          "name": "1.3 Resend Email Verification",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"student1@studio.ua\"\n}"
+            },
+            "url": { "raw": "{{gatewayUrl}}/auth/resend-verification", "host": ["{{gatewayUrl}}"], "path": ["auth", "resend-verification"] }
+          }
+        },
+        {
+          "name": "1.4 Login (Access Token + HttpOnly Refresh Cookie)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "  const json = pm.response.json();",
+                  "  pm.collectionVariables.set('accessToken', json.accessToken);",
+                  "  pm.collectionVariables.set('userId', json.userId);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"admin@studio.ua\",\n  \"password\": \"Admin123!\"\n}"
+            },
+            "url": { "raw": "{{gatewayUrl}}/auth/login", "host": ["{{gatewayUrl}}"], "path": ["auth", "login"] }
+          }
+        },
+        {
+          "name": "1.5 Refresh Token (Rotation via Cookie)",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{gatewayUrl}}/auth/refresh-token", "host": ["{{gatewayUrl}}"], "path": ["auth", "refresh-token"] }
+          }
+        },
+        {
+          "name": "1.6 Forgot Password",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"student1@studio.ua\"\n}"
+            },
+            "url": { "raw": "{{gatewayUrl}}/auth/forgot-password", "host": ["{{gatewayUrl}}"], "path": ["auth", "forgot-password"] }
+          }
+        },
+        {
+          "name": "1.7 Reset Password (Revokes All Refresh Tokens)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"student1@studio.ua\",\n  \"token\": \"{{resetPasswordToken}}\",\n  \"newPassword\": \"NewStrongPass2!\"\n}"
+            },
+            "url": { "raw": "{{gatewayUrl}}/auth/reset-password", "host": ["{{gatewayUrl}}"], "path": ["auth", "reset-password"] }
+          }
+        },
+        {
+          "name": "1.8 Change Password (Authenticated)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{accessToken}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"currentPassword\": \"NewStrongPass2!\",\n  \"newPassword\": \"ChangedPass3!\"\n}"
+            },
+            "url": { "raw": "{{gatewayUrl}}/auth/change-password", "host": ["{{gatewayUrl}}"], "path": ["auth", "change-password"] }
+          }
+        },
+        {
+          "name": "1.9 List All Users (Admin Only)",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }],
+            "url": { "raw": "{{gatewayUrl}}/users", "host": ["{{gatewayUrl}}"], "path": ["users"] }
+          }
+        },
+        {
+          "name": "1.10 Get User Profile (Owner or Admin)",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }],
+            "url": { "raw": "{{gatewayUrl}}/users/{{userId}}", "host": ["{{gatewayUrl}}"], "path": ["users", "{{userId}}"] }
+          }
+        },
+        {
+          "name": "1.11 Revoke Refresh Token",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }],
+            "url": { "raw": "{{gatewayUrl}}/auth/revoke-token", "host": ["{{gatewayUrl}}"], "path": ["auth", "revoke-token"] }
+          }
+        },
+        {
+          "name": "1.12 Logout",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }],
+            "url": { "raw": "{{gatewayUrl}}/auth/logout", "host": ["{{gatewayUrl}}"], "path": ["auth", "logout"] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Part 2 — Duende IdentityServer (OAuth 2.0 / OIDC)",
+      "item": [
+        {
+          "name": "2.1 OpenID Connect Discovery Document",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{identityServerUrl}}/.well-known/openid-configuration",
+              "host": ["{{identityServerUrl}}"],
+              "path": [".well-known", "openid-configuration"]
+            }
+          }
+        },
+        {
+          "name": "2.2 Client Credentials Token (aggregator_service — M2M, no sub)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "  pm.collectionVariables.set('m2mToken', pm.response.json().access_token);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/x-www-form-urlencoded" }],
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": [
+                { "key": "grant_type", "value": "client_credentials" },
+                { "key": "client_id", "value": "aggregator_service" },
+                { "key": "client_secret", "value": "aggregator_secret" },
+                { "key": "scope", "value": "orders_api orders.read products_api products.read" }
+              ]
+            },
+            "url": {
+              "raw": "{{identityServerUrl}}/connect/token",
+              "host": ["{{identityServerUrl}}"],
+              "path": ["connect", "token"]
+            }
+          }
+        },
+        {
+          "name": "2.3 Call Aggregator with IdentityServer Token",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{m2mToken}}" }],
+            "url": {
+              "raw": "{{gatewayUrl}}/api/aggregator/orders/1/full",
+              "host": ["{{gatewayUrl}}"],
+              "path": ["api", "aggregator", "orders", "1", "full"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Part 3 — Keycloak (DevRealmDrivers) & Permission Matrix",
+      "item": [
+        {
+          "name": "3.1 Keycloak Token — alice.admin",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": ["if (pm.response.code === 200) pm.collectionVariables.set('kcToken', pm.response.json().access_token);"]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/x-www-form-urlencoded" }],
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": [
+                { "key": "grant_type", "value": "password" },
+                { "key": "client_id", "value": "orders.postman" },
+                { "key": "client_secret", "value": "<pulumi stack output ClientSecrets>" },
+                { "key": "username", "value": "alice.admin" },
+                { "key": "password", "value": "Admin123!" }
+              ]
+            },
+            "url": {
+              "raw": "{{keycloakUrl}}/realms/{{realm}}/protocol/openid-connect/token",
+              "host": ["{{keycloakUrl}}"],
+              "path": ["realms", "{{realm}}", "protocol", "openid-connect", "token"]
+            }
+          }
+        },
+        {
+          "name": "3.2 Keycloak Token — john.manager",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": ["if (pm.response.code === 200) pm.collectionVariables.set('kcToken', pm.response.json().access_token);"]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/x-www-form-urlencoded" }],
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": [
+                { "key": "grant_type", "value": "password" },
+                { "key": "client_id", "value": "orders.postman" },
+                { "key": "client_secret", "value": "<pulumi stack output ClientSecrets>" },
+                { "key": "username", "value": "john.manager" },
+                { "key": "password", "value": "Manager123!" }
+              ]
+            },
+            "url": {
+              "raw": "{{keycloakUrl}}/realms/{{realm}}/protocol/openid-connect/token",
+              "host": ["{{keycloakUrl}}"],
+              "path": ["realms", "{{realm}}", "protocol", "openid-connect", "token"]
+            }
+          }
+        },
+        {
+          "name": "3.3 Keycloak Token — bob.user",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": ["if (pm.response.code === 200) pm.collectionVariables.set('kcToken', pm.response.json().access_token);"]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/x-www-form-urlencoded" }],
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": [
+                { "key": "grant_type", "value": "password" },
+                { "key": "client_id", "value": "orders.postman" },
+                { "key": "client_secret", "value": "<pulumi stack output ClientSecrets>" },
+                { "key": "username", "value": "bob.user" },
+                { "key": "password", "value": "User123!" }
+              ]
+            },
+            "url": {
+              "raw": "{{keycloakUrl}}/realms/{{realm}}/protocol/openid-connect/token",
+              "host": ["{{keycloakUrl}}"],
+              "path": ["realms", "{{realm}}", "protocol", "openid-connect", "token"]
+            }
+          }
+        },
+        {
+          "name": "3.4 Keycloak Token — guest.viewer",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": ["if (pm.response.code === 200) pm.collectionVariables.set('kcToken', pm.response.json().access_token);"]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/x-www-form-urlencoded" }],
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": [
+                { "key": "grant_type", "value": "password" },
+                { "key": "client_id", "value": "orders.postman" },
+                { "key": "client_secret", "value": "<pulumi stack output ClientSecrets>" },
+                { "key": "username", "value": "guest.viewer" },
+                { "key": "password", "value": "Guest123!" }
+              ]
+            },
+            "url": {
+              "raw": "{{keycloakUrl}}/realms/{{realm}}/protocol/openid-connect/token",
+              "host": ["{{keycloakUrl}}"],
+              "path": ["realms", "{{realm}}", "protocol", "openid-connect", "token"]
+            }
+          }
+        },
+        {
+          "name": "3.5 Exchange for Keycloak UMA RPT (authorization.permissions for orders-api)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": ["if (pm.response.code === 200) pm.collectionVariables.set('kcToken', pm.response.json().access_token);"]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/x-www-form-urlencoded" },
+              { "key": "Authorization", "value": "Bearer {{kcToken}}" }
+            ],
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": [
+                { "key": "grant_type", "value": "urn:ietf:params:oauth:grant-type:uma-ticket" },
+                { "key": "audience", "value": "orders-api" }
+              ]
+            },
+            "url": {
+              "raw": "{{keycloakUrl}}/realms/{{realm}}/protocol/openid-connect/token",
+              "host": ["{{keycloakUrl}}"],
+              "path": ["realms", "{{realm}}", "protocol", "openid-connect", "token"]
+            }
+          }
+        },
+        {
+          "name": "3.6 Orders — GET /orders [orders:read]",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{kcToken}}" }],
+            "url": { "raw": "{{gatewayUrl}}/orders", "host": ["{{gatewayUrl}}"], "path": ["orders"] }
+          }
+        },
+        {
+          "name": "3.7 Orders — DELETE /orders/1 [orders:delete — Admin Only]",
+          "request": {
+            "method": "DELETE",
+            "header": [{ "key": "Authorization", "value": "Bearer {{kcToken}}" }],
+            "url": { "raw": "{{gatewayUrl}}/orders/1", "host": ["{{gatewayUrl}}"], "path": ["orders", "1"] }
+          }
+        },
+        {
+          "name": "3.8 Products — GET /products [products:read — All Roles]",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{kcToken}}" }],
+            "url": { "raw": "{{gatewayUrl}}/products", "host": ["{{gatewayUrl}}"], "path": ["products"] }
+          }
+        },
+        {
+          "name": "3.9 Products — POST /products/1/publish [products:publish — Admin/Manager]",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Authorization", "value": "Bearer {{kcToken}}" }],
+            "url": { "raw": "{{gatewayUrl}}/products/1/publish", "host": ["{{gatewayUrl}}"], "path": ["products", "1", "publish"] }
+          }
+        },
+        {
+          "name": "3.10 Payments — GET /payments [payments:read — Admin Only (403 for Manager/User/Guest)]",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{kcToken}}" }],
+            "url": { "raw": "{{gatewayUrl}}/payments", "host": ["{{gatewayUrl}}"], "path": ["payments"] }
+          }
+        },
+        {
+          "name": "3.11 Payments — POST /payments/process [payments:process — Admin Only]",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{kcToken}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"orderId\": 1,\n  \"amount\": 1500.00,\n  \"currency\": \"UAH\"\n}"
+            },
+            "url": { "raw": "{{gatewayUrl}}/payments/process", "host": ["{{gatewayUrl}}"], "path": ["payments", "process"] }
+          }
+        },
+        {
+          "name": "3.12 Payments — POST /payments/refund [payments:refund — Admin Only]",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{kcToken}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"paymentId\": \"PAY-1001\",\n  \"reason\": \"Customer cancellation\"\n}"
+            },
+            "url": { "raw": "{{gatewayUrl}}/payments/refund", "host": ["{{gatewayUrl}}"], "path": ["payments", "refund"] }
+          }
+        }
+      ]
+    }
+  ]
+}
